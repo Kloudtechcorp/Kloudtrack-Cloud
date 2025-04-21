@@ -1,0 +1,251 @@
+#include <Arduino.h>
+#include "secrets.h"
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "WiFi.h"
+#include <FS.h>
+#include <SPIFFS.h>
+
+#define AWS_IOT_PUBLISH_TOPIC "Kloudtrack/data"
+#define AWS_IOT_SUBSCRIBE_TOPIC "Kloudtrack/cmd"
+#define DEVICE_ID "Kloudtrack-1"
+
+unsigned long previousMillis = 0;
+const long interval = 10000;  // 10 seconds interval for your task
+
+WiFiClientSecure net = WiFiClientSecure();
+PubSubClient client(net);
+
+int wifiRetryCount = 0;
+int mqttRetryCount = 0;
+int maxRetries = 5; 
+
+void storeMessageToSPIFFS(const char* message) {
+  int retryCount = 0;
+  bool success = false;
+  while (retryCount < maxRetries) {
+    File file = SPIFFS.open("/unsent.txt", FILE_APPEND);
+    if (file) {
+      file.println(message);
+      file.close();
+      Serial.println("Message stored to SPIFFS");
+      success = true;
+      break;
+    } else {
+      Serial.printf("Failed to open file for writing. Attempt %d\n", retryCount + 1);
+      retryCount++;
+      delay(1000);
+    }
+  }
+  if (!success) {
+    Serial.println("Failed to store message after multiple attempts.");
+  } else {
+    Serial.println("Message stored successfully.");
+  }
+}
+
+void resendMessagesFromSPIFFS() {
+  if (!SPIFFS.exists("/unsent.txt")) {
+    return;
+  }
+  int retryCount = 0;
+  bool success = false;
+  File file = SPIFFS.open("/unsent.txt", FILE_READ);
+
+  while (retryCount < maxRetries && !file) {
+    Serial.printf("Failed to open file for reading. Attempt %d\n", retryCount + 1);
+    retryCount++;
+    delay(1000);
+    file = SPIFFS.open("/unsent.txt", FILE_READ);  // Retry opening the file
+  }
+
+  if (!file) {
+    Serial.println("Failed to open file for reading");
+    return;
+  }
+
+  String messagesToKeep = "";
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    
+    if (!line.isEmpty()) {
+      Serial.println("Resending message: " + line);
+      if (client.publish(AWS_IOT_PUBLISH_TOPIC, line.c_str())) {
+        Serial.println("Message sent successfully.");
+      } else {
+        Serial.println("Failed to send message. Storing for later.");
+        messagesToKeep += line + "\n";  // Keep unsent messages
+      }
+    }
+  }
+  file.close();
+
+  if (messagesToKeep.isEmpty()) {
+    SPIFFS.remove("/unsent.txt");  // Remove file if all messages sent successfully
+    Serial.println("All saved messages sent. File deleted.");
+  }
+  else {
+    File writeFile = SPIFFS.open("/unsent.txt", FILE_WRITE);
+    if (!writeFile) {
+      Serial.println("Failed to open file for rewriting");
+      return;
+    }
+    else {
+      writeFile.print(messagesToKeep);  // Write back unsent messages
+      writeFile.close();
+      Serial.println("Kept unsent messages for later retry");
+    }
+  }  
+}
+
+void connectWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Connecting to WiFi...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    unsigned long wifiStart = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart < 10000)) {
+      delay(500);
+      Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi connected!");
+      wifiRetryCount = 0;
+    } else {
+      wifiRetryCount++;
+      Serial.printf("\nWiFi connection failed. Attempt %d/%d\n", wifiRetryCount, maxRetries);
+    }
+    if (wifiRetryCount >= maxRetries) {
+      Serial.println("Maximum WiFi retries reached. Restarting ESP32.");
+      ESP.restart();
+    }
+  }
+}
+
+void messageHandler(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message received on topic: ");
+  Serial.println(topic);
+
+  // Deserialize the incoming JSON payload
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, payload);
+
+  // Check for errors in JSON deserialization
+  if (error) {
+    Serial.print("Failed to deserialize JSON: ");
+    Serial.println(error.c_str());  // Print the error message
+    return;
+  }
+
+  // Extract the "message" field from the payload
+  const char* targetDevice = doc["device_id"];
+  const char* message = doc["message"];
+
+  if (message && (strcmp(targetDevice, DEVICE_ID) == 0 || strcmp(targetDevice, "all") == 0)) {
+    if (strcmp(message, "reset") == 0) {
+      Serial.println("Reset command received. Restarting...");
+      delay(500);
+      ESP.restart(); 
+    }
+  } else {
+    Serial.println("This message is not for this device.");
+  }
+}
+
+void publishMessage() {
+  // Create JSON document
+  StaticJsonDocument<256> doc;
+
+  doc["device_id"] = DEVICE_ID;
+  doc["temperature"] = random(20, 35);     // Celsius
+  doc["humidity"] = random(40, 70);        // %
+  doc["pressure"] = random(990, 1020);     // hPa
+
+  // Serialize JSON to buffer
+  char jsonBuffer[256];
+  serializeJson(doc, jsonBuffer);
+
+  if (!client.connected()) {
+    Serial.println("Not connected. Storing to SPIFFS.");
+    storeMessageToSPIFFS(jsonBuffer); 
+    return;
+  }
+
+  if (client.publish(AWS_IOT_PUBLISH_TOPIC, jsonBuffer)) {
+    Serial.println("Weather data published:");
+    serializeJsonPretty(doc, Serial);
+    Serial.println();
+  } else {
+    Serial.println("Failed to publish data.");
+    storeMessageToSPIFFS(jsonBuffer);
+  }
+}
+
+void connectAWS() {
+  net.setCACert(AWS_CERT_CA);
+  net.setCertificate(AWS_CERT_CRT);
+  net.setPrivateKey(AWS_CERT_PRIVATE);
+
+  client.setServer(AWS_IOT_ENDPOINT, 8883);
+  client.setCallback(messageHandler);
+
+  if (!client.connected()) {
+    mqttRetryCount++;
+    Serial.printf("Connecting to AWS IoT. Attempt %d/%d\n", mqttRetryCount, maxRetries);
+
+    if (client.connect(DEVICE_ID)) {
+      mqttRetryCount = 0;  // Reset retry count on success
+      Serial.println("Connected to AWS IoT!");
+      client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
+    } else {
+      Serial.println("Failed to connect to AWS IoT.");
+    }
+  }
+  
+  if (mqttRetryCount >= maxRetries) {
+    Serial.println("Maximum MQTT retries reached. Restarting ESP32.");
+    ESP.restart();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n==== Kloudtrack Weather Station ====");
+  
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed");
+    return;
+  }
+  else {
+    Serial.println("SPIFFS Mount Success");
+  }
+  Serial.printf("Total SPIFFS space: %u bytes\n", SPIFFS.totalBytes());
+  Serial.printf("Used SPIFFS space: %u bytes\n", SPIFFS.usedBytes());
+  
+  connectWiFi();
+  connectAWS();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    publishMessage();
+  }
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();  // Reconnect to WiFi if disconnected
+  }
+  
+  if (!client.connected()) {
+    connectAWS();  // Reconnect to AWS IoT if disconnected
+  }
+  
+  if (WiFi.status() == WL_CONNECTED && client.connected()) {
+    resendMessagesFromSPIFFS();
+  }
+
+  client.loop(); // Always called every cycle
+}

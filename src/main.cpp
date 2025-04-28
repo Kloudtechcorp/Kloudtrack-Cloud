@@ -19,6 +19,16 @@
 char AWS_IOT_DEVICE_TOPIC[50];
 char AWS_IOT_DEVICE_WEATHER_TOPIC[50];
 
+/*
+#define AWS_IOT_ALL_COMMAND_TOPIC "kloudtrack/all/command"
+#define AWS_IOT_ALL_STATUS_TOPIC "kloudtrack/all/status"
+#define AWS_IOT_ALL_DATA_TOPIC "kloudtrack/all/data"
+
+char AWS_IOT_DEVICE_COMMAND_TOPIC[50];
+char AWS_IOT_DEVICE_STATUS_TOPIC[50];
+char AWS_IOT_DEVICE_DATA_TOPIC[50];
+*/
+
 // Current firmware version
 #define FIRMWARE_VERSION "1.2.0"
 
@@ -478,7 +488,7 @@ void setup() {
     sprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, "Kloudtrack/device/%s/weather", DEVICE_ID);
 
     Serial.println("\n\n---------------------------------");
-    Serial.println("ESP32 Weather Station with AWS IoT");
+    Serial.println("ESP32 Weather Station with AWS IoT 2");
     Serial.printf("Device ID: %s\n", DEVICE_ID);
     Serial.printf("Current Firmware Version: %s\n", FIRMWARE_VERSION);
     Serial.println("---------------------------------\n");

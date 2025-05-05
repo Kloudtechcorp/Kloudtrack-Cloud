@@ -9,28 +9,12 @@
 #include <WiFiClientSecure.h>
 
 // MQTT Topics
-#define AWS_IOT_SUBSCRIBE_TOPIC "Kloudtrack/ota/cmd"
-#define AWS_IOT_WEATHER_TOPIC "Kloudtrack/weather/data"
-#define AWS_IOT_STATUS_TOPIC "Kloudtrack/ota/status"
-#define AWS_IOT_ACTIVATION_TOPIC "Kloudtrack/admin/activation"
-#define AWS_IOT_ALL_TOPIC "Kloudtrack/all/cmd"
-
-// Define device-specific topic (will be configured dynamically)
-char AWS_IOT_DEVICE_TOPIC[50];
-char AWS_IOT_DEVICE_WEATHER_TOPIC[50];
-
-/*
-#define AWS_IOT_ALL_COMMAND_TOPIC "kloudtrack/all/command"
-#define AWS_IOT_ALL_STATUS_TOPIC "kloudtrack/all/status"
-#define AWS_IOT_ALL_DATA_TOPIC "kloudtrack/all/data"
-
 char AWS_IOT_DEVICE_COMMAND_TOPIC[50];
-char AWS_IOT_DEVICE_STATUS_TOPIC[50];
-char AWS_IOT_DEVICE_DATA_TOPIC[50];
-*/
+char AWS_IOT_DEVICE_WEATHER_TOPIC[50];
+char AWS_IOT_DEVICE_ACTIVATION_TOPIC[50];
 
 // Current firmware version
-#define FIRMWARE_VERSION "1.2.0"
+#define FIRMWARE_VERSION "1.3.0"
 
 // Activation key that admin must provide (should be unique per device)
 #define ACTIVATION_KEY "KT-SECURE-KEY-12345"
@@ -94,10 +78,27 @@ void activateDevice(bool activate) {
     char jsonBuffer[256];
     serializeJson(doc, jsonBuffer);
     
-    client.publish(AWS_IOT_STATUS_TOPIC, jsonBuffer);
+    // Publish to device-specific activation topic
+    sprintf(AWS_IOT_DEVICE_ACTIVATION_TOPIC, "kloudtrack/%s/activation", DEVICE_ID);
+    client.publish(AWS_IOT_DEVICE_ACTIVATION_TOPIC, jsonBuffer);
     
     Serial.printf("Device %s\n", activate ? "ACTIVATED" : "DEACTIVATED");
 }
+
+void getMemoryStats(JsonObject& memoryStats) {
+    // Set total sizes to match PlatformIO values
+    const float TOTAL_RAM = 327680.0;       // bytes
+    const float TOTAL_FLASH = 1310720.0;    // bytes
+
+    // RAM usage percent (used = total - free heap)
+    float used_ram = TOTAL_RAM - ESP.getFreeHeap();
+    memoryStats["ram_usage_percent"] = used_ram * 100.0 / TOTAL_RAM;
+
+    // Flash usage percent
+    float flash_used = ESP.getSketchSize();
+    memoryStats["flash_usage_percent"] = flash_used * 100.0 / TOTAL_FLASH;
+}
+
 
 // Function to publish status updates
 void publishUpdateStatus(const char* status, const char* message) {
@@ -107,17 +108,17 @@ void publishUpdateStatus(const char* status, const char* message) {
     doc["status"] = status;
     doc["message"] = message;
     doc["activated"] = deviceActivated;
-    doc["mac"] = DEVICE_ID;
     
-    char jsonBuffer[256];
+    // Add memory statistics
+    JsonObject memoryStats = doc.createNestedObject("memory");
+    getMemoryStats(memoryStats);
+    
+    char jsonBuffer[512];
     serializeJson(doc, jsonBuffer);
     
-    // Publish to both general status topic and device-specific status topic
-    client.publish(AWS_IOT_STATUS_TOPIC, jsonBuffer);
-    
-    char deviceStatusTopic[50];
-    sprintf(deviceStatusTopic, "Kloudtrack/device/%s/status", DEVICE_ID);
-    client.publish(deviceStatusTopic, jsonBuffer);
+    // Publish to device-specific status topic
+    sprintf(AWS_IOT_DEVICE_COMMAND_TOPIC, "kloudtrack/%s/command", DEVICE_ID);
+    client.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonBuffer);
     
     Serial.printf("Published status: %s - %s\n", status, message);
 }
@@ -152,24 +153,14 @@ void publishWeatherData() {
     weather["wind_direction"] = windDirection;
     weather["condition"] = weatherCondition;
     
-    // Device info
-    JsonObject device = doc.createNestedObject("device");
-    device["firmware"] = FIRMWARE_VERSION;
-    device["activated"] = deviceActivated;
-    
     // Serialize to JSON
     size_t msgLen = measureJson(doc) + 1;
     char* jsonBuffer = new char[msgLen];
     serializeJson(doc, jsonBuffer, msgLen);
     
-    // Publish to global weather topic
-    client.publish(AWS_IOT_WEATHER_TOPIC, jsonBuffer);
-    
-    // Also publish to device-specific weather topic
+    // Publish to device-specific weather topic
+    sprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, "kloudtrack/%s/data", DEVICE_ID);
     client.publish(AWS_IOT_DEVICE_WEATHER_TOPIC, jsonBuffer);
-    
-    Serial.println("Published weather data:");
-    Serial.println(jsonBuffer);
     delete[] jsonBuffer;
 }
 
@@ -305,6 +296,7 @@ void handleActivationCommand(const JsonDocument& doc) {
     else {
         Serial.println("Unknown activation action");
     }
+    Serial.println("---------------------------------");
 }
 
 // Handle update commands
@@ -366,12 +358,15 @@ void messageHandler(char* topic, byte* payload, unsigned int length) {
     }
 
     // Handle based on topic
-    if (strcmp(topic, AWS_IOT_ACTIVATION_TOPIC) == 0) {
+    if (strcmp(topic, AWS_IOT_DEVICE_ACTIVATION_TOPIC) == 0) {
         handleActivationCommand(doc);
     }
-    else if (strcmp(topic, AWS_IOT_SUBSCRIBE_TOPIC) == 0 || 
-             strcmp(topic, AWS_IOT_DEVICE_TOPIC) == 0 || 
-             strcmp(topic, AWS_IOT_ALL_TOPIC) == 0) {
+    // else if (strcmp(topic, AWS_IOT_DEVICE_WEATHER_TOPIC) == 0) {
+    //     // Force publish weather data when requested
+    //     publishWeatherData();
+    //     // publishUpdateStatus("Info", "Weather data published on demand");
+    // }
+    else if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0) {
         const char* command = doc["command"];
         
         if (command && strcmp(command, "update") == 0) {
@@ -380,11 +375,6 @@ void messageHandler(char* topic, byte* payload, unsigned int length) {
         else if (command && strcmp(command, "status") == 0) {
             // Respond with current status when requested
             publishUpdateStatus("Info", "Status report requested");
-        }
-        else if (command && strcmp(command, "weather") == 0) {
-            // Force publish weather data when requested
-            publishWeatherData();
-            publishUpdateStatus("Info", "Weather data published on demand");
         }
         else if (command && strcmp(command, "reset") == 0) {
             // Publish notification that device is restarting
@@ -399,14 +389,15 @@ void messageHandler(char* topic, byte* payload, unsigned int length) {
             ESP.restart();
         }
         else {
-            Serial.println("Unknown command received");
+            Serial.println("No command received");
         }
     }
+    Serial.println("---------------------------------");
 }
 
 void connectWiFi() {
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Connecting to WiFi...");
+        Serial.print("Connecting to WiFi");
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
         unsigned long wifiStart = millis();
         while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart < 10000)) {
@@ -425,6 +416,7 @@ void connectWiFi() {
           ESP.restart();
         }
     }
+    Serial.println("---------------------------------");
 }
 
 void connectToAWS() {
@@ -437,7 +429,7 @@ void connectToAWS() {
     client.setServer(AWS_IOT_ENDPOINT, 8883);
     client.setCallback(messageHandler);
 
-    Serial.print("Connecting to AWS IoT Core...");
+    Serial.println("Connecting to AWS IoT Core...");
     
     if (!client.connected()) {
         mqttRetryCount++;
@@ -449,10 +441,9 @@ void connectToAWS() {
             reconnectDelay = 1000;
             
             // Subscribe to all relevant topics
-            client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);  // Legacy topic
-            client.subscribe(AWS_IOT_ACTIVATION_TOPIC); // Activation topic
-            client.subscribe(AWS_IOT_DEVICE_TOPIC);     // Device-specific topic
-            client.subscribe(AWS_IOT_ALL_TOPIC);        // All-devices topic
+            client.subscribe(AWS_IOT_DEVICE_ACTIVATION_TOPIC);
+            client.subscribe(AWS_IOT_DEVICE_COMMAND_TOPIC);
+            client.subscribe(AWS_IOT_DEVICE_WEATHER_TOPIC);
             
             // Check activation status
             deviceActivated = isDeviceActivated();
@@ -474,6 +465,7 @@ void connectToAWS() {
         Serial.println("Maximum MQTT retries reached. Restarting ESP32.");
         ESP.restart();
     }
+    Serial.println("---------------------------------");
 }
 
 void setup() {
@@ -484,14 +476,15 @@ void setup() {
     getMacAddress(DEVICE_ID);
     
     // Configure device-specific topics
-    sprintf(AWS_IOT_DEVICE_TOPIC, "Kloudtrack/device/%s/cmd", DEVICE_ID);
-    sprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, "Kloudtrack/device/%s/weather", DEVICE_ID);
+    sprintf(AWS_IOT_DEVICE_ACTIVATION_TOPIC, "kloudtrack/%s/activation", DEVICE_ID);
+    sprintf(AWS_IOT_DEVICE_COMMAND_TOPIC, "kloudtrack/%s/command", DEVICE_ID);
+    sprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, "kloudtrack/%s/data", DEVICE_ID);
 
     Serial.println("\n\n---------------------------------");
     Serial.println("ESP32 Weather Station with AWS IoT 2");
     Serial.printf("Device ID: %s\n", DEVICE_ID);
     Serial.printf("Current Firmware Version: %s\n", FIRMWARE_VERSION);
-    Serial.println("---------------------------------\n");
+    Serial.println("---------------------------------");
 
     // Connect to WiFi
     connectWiFi();
@@ -502,9 +495,7 @@ void setup() {
 
     // Connect to AWS IoT
     connectToAWS();
-
-    // Publish initial weather data
-    publishWeatherData();
+    lastWeatherPublish = millis();
 }
 
 void loop() {

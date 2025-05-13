@@ -1,0 +1,404 @@
+#include <Arduino.h>
+#include <PubSubClient.h>
+#include <Update.h>
+#include "secrets.h"
+#include <ArduinoJson.h>
+#include <Preferences.h>
+
+// MQTT Topics
+char AWS_IOT_DEVICE_COMMAND_TOPIC[50];
+char AWS_IOT_DEVICE_WEATHER_TOPIC[50];
+char AWS_IOT_DEVICE_ACTIVATION_TOPIC[50];
+
+// Firmware Version
+#define FIRMWARE_VERSION "1.3.1"
+
+// Activation key
+#define ACTIVATION_KEY "KT-SECURE-KEY-12345"
+
+// Weather data parameters
+#define WEATHER_PUBLISH_INTERVAL 60000
+unsigned long lastWeatherPublish = 0;
+
+// Weather data ranges
+#define MIN_TEMPERATURE 15.0
+#define MAX_TEMPERATURE 35.0
+#define MIN_HUMIDITY 30.0
+#define MAX_HUMIDITY 90.0
+#define MIN_PRESSURE 980.0
+#define MAX_PRESSURE 1040.0
+#define MIN_WIND_SPEED 0.0
+#define MAX_WIND_SPEED 20.0
+
+#define TINY_GSM_MODEM_SIM7600
+#include <TinyGsmClient.h>
+#include <SSLClient.h>
+
+// GSM Parameters
+#define UART_BAUD 115200
+#define PIN_DTR 25
+#define PIN_TX 26
+#define PIN_RX 27
+#define PWR_PIN 4
+#define PIN_RI 33
+#define RESET 5
+#define SerialMon Serial
+
+HardwareSerial SerialAT(1);
+TinyGsm modem(SerialAT);
+TinyGsmClient baseClient(modem);
+SSLClient sslClient(&baseClient);
+PubSubClient mqttClient(sslClient);
+Preferences preferences;
+bool deviceActivated = false;
+bool gsmConnected = false;
+int gsmRetryCount = 0;
+int mqttRetryCount = 0;
+int maxRetries = 5;
+unsigned long reconnectDelay = 1000;
+const unsigned long maxReconnectDelay = 60000;
+char DEVICE_ID[20];
+
+// Function to get MAC address as a string
+void getMacAddress(char* macStr) {
+    uint64_t mac = ESP.getEfuseMac();
+    sprintf(macStr, "KT%08X", (uint32_t)mac);
+}
+
+// Function to get memory statistics
+void getMemoryStats(JsonObject& memoryStats) {
+    const float TOTAL_RAM = 327680.0;
+    const float TOTAL_FLASH = 1310720.0;
+
+    // RAM usage percent (used = total - free heap)
+    float used_ram = TOTAL_RAM - ESP.getFreeHeap();
+    memoryStats["ram_usage_percent"] = used_ram * 100.0 / TOTAL_RAM;
+
+    // Flash usage percent
+    float flash_used = ESP.getSketchSize();
+    memoryStats["flash_usage_percent"] = flash_used * 100.0 / TOTAL_FLASH;
+}
+
+// Function to publish status updates
+void publishUpdateStatus(const char* status, const char* message) {
+    StaticJsonDocument<200> doc;
+    doc["device_id"] = DEVICE_ID;
+    doc["firmware_version"] = FIRMWARE_VERSION;
+    doc["status"] = status;
+    doc["message"] = message;
+    doc["activated"] = deviceActivated;
+    
+    // Add memory statistics
+    JsonObject memoryStats = doc.createNestedObject("memory");
+    getMemoryStats(memoryStats);
+    
+    char jsonBuffer[512];
+    serializeJson(doc, jsonBuffer);
+    
+    // Publish to device-specific status topic
+    sprintf(AWS_IOT_DEVICE_COMMAND_TOPIC, "kloudtrack/%s/command", DEVICE_ID);
+    mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonBuffer);
+    
+    Serial.printf("Published status: %s - %s\n", status, message);
+}
+
+// Function to check if device is activated
+bool isDeviceActivated() {
+    preferences.begin("kloudtrack", false);
+    bool activated = preferences.getBool("activated", false);
+    preferences.end();
+    return activated;
+}
+
+// Function to activate the device
+void activateDevice(bool activate) {
+    preferences.begin("kloudtrack", false);
+    preferences.putBool("activated", activate);
+    preferences.end();
+    deviceActivated = activate;
+    
+    // Publish activation status
+    StaticJsonDocument<200> doc;
+    doc["device_id"] = DEVICE_ID;
+    doc["firmware_version"] = FIRMWARE_VERSION;
+    doc["activated"] = activate;
+    
+    char jsonBuffer[256];
+    serializeJson(doc, jsonBuffer);
+    
+    // Publish to device-specific activation topic
+    sprintf(AWS_IOT_DEVICE_ACTIVATION_TOPIC, "kloudtrack/%s/activation", DEVICE_ID);
+    mqttClient.publish(AWS_IOT_DEVICE_ACTIVATION_TOPIC, jsonBuffer);
+    
+    Serial.printf("Device %s\n", activate ? "ACTIVATED" : "DEACTIVATED");
+}
+
+// Handle activation commands
+void handleActivationCommand(const JsonDocument& doc) {
+    const char* action = doc["action"];
+    const char* key = doc["key"];
+    
+    if (!action) {
+        Serial.println("Invalid activation command: missing action");
+        return;
+    }
+    
+    if (strcmp(action, "activate") == 0) {
+        // Check if key is correct
+        if (!key || strcmp(key, ACTIVATION_KEY) != 0) {
+            Serial.println("Activation rejected: Invalid key");
+            publishUpdateStatus("Access_denied", "Invalid activation key");
+            return;
+        }
+        
+        activateDevice(true);
+        Serial.println("Device activated successfully");
+        publishUpdateStatus("Activated", "Device activated successfully");
+    } 
+    else if (strcmp(action, "deactivate") == 0) {
+        // Check if key is correct
+        if (!key || strcmp(key, ACTIVATION_KEY) != 0) {
+            Serial.println("Deactivation rejected: Invalid key");
+            publishUpdateStatus("Access_denied", "Invalid activation key");
+            return;
+        }
+        
+        activateDevice(false);
+        Serial.println("Device deactivated");
+        publishUpdateStatus("Deactivated", "Device deactivated");
+    }
+    else {
+        Serial.println("Unknown activation action");
+    }
+    Serial.println("---------------------------------");
+}
+
+// Function to generate random weather data and publish it
+void publishWeatherData() {
+    // Generate random weather data
+    float temperature = random(MIN_TEMPERATURE * 100, MAX_TEMPERATURE * 100) / 100.0;
+    float humidity = random(MIN_HUMIDITY * 100, MAX_HUMIDITY * 100) / 100.0;
+    float pressure = random(MIN_PRESSURE * 10, MAX_PRESSURE * 10) / 10.0;
+    float windSpeed = random(MIN_WIND_SPEED * 100, MAX_WIND_SPEED * 100) / 100.0;
+    
+    // Get random wind direction (N, NE, E, SE, S, SW, W, NW)
+    const char* windDirections[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+    const char* windDirection = windDirections[random(0, 8)];
+    
+    // Get random weather condition
+    const char* weatherConditions[] = {"Sunny", "Partly Cloudy", "Cloudy", "Rainy", "Thunderstorm", "Foggy", "Snowy"};
+    const char* weatherCondition = weatherConditions[random(0, 7)];
+    
+    // Create JSON document
+    StaticJsonDocument<256> doc;
+    doc["device_id"] = DEVICE_ID;
+    doc["timestamp"] = millis();
+    
+    // Weather data
+    JsonObject weather = doc.createNestedObject("weather");
+    weather["temperature"] = temperature;
+    weather["humidity"] = humidity;
+    weather["pressure"] = pressure;
+    weather["wind_speed"] = windSpeed;
+    weather["wind_direction"] = windDirection;
+    weather["condition"] = weatherCondition;
+    
+    // Serialize to JSON
+    size_t msgLen = measureJson(doc) + 1;
+    char* jsonBuffer = new char[msgLen];
+    serializeJson(doc, jsonBuffer, msgLen);
+    
+    // Publish to device-specific weather topic
+    sprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, "kloudtrack/%s/data", DEVICE_ID);
+    mqttClient.publish(AWS_IOT_DEVICE_WEATHER_TOPIC, jsonBuffer);
+    delete[] jsonBuffer;
+}
+
+// MQTT message handler
+void messageHandler(char* topic, byte* payload, unsigned int length) {
+    Serial.print("Message received on topic: ");
+    Serial.println(topic);
+
+    // Create a null-terminated string from the payload
+    char* payloadStr = new char[length + 1];
+    memcpy(payloadStr, payload, length);
+    payloadStr[length] = '\0';
+    Serial.println(payloadStr);
+
+    // Parse JSON
+    StaticJsonDocument<512> doc;
+    DeserializationError error = deserializeJson(doc, payloadStr);
+    delete[] payloadStr;
+    
+    if (error) {
+        Serial.print("DeserializeJson() failed: ");
+        Serial.println(error.f_str());
+        return;
+    }
+
+    // Handle based on topic
+    if (strcmp(topic, AWS_IOT_DEVICE_ACTIVATION_TOPIC) == 0) {
+        handleActivationCommand(doc);
+    }
+    else if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0) {
+        const char* command = doc["command"];
+        
+        if (command && strcmp(command, "status") == 0) {
+            // Respond with current status when requested
+            publishUpdateStatus("Info", "Status report requested");
+        }
+        else if (command && strcmp(command, "reset") == 0) {
+            // Publish notification that device is restarting
+            publishUpdateStatus("Resetting", "Device restarting per command request");
+            
+            Serial.println("Reset command received. Restarting device...");
+            
+            // Give time for the MQTT message to be sent
+            delay(1000);
+            
+            // Restart the ESP32
+            ESP.restart();
+        }
+        else {
+            Serial.println("No command received");
+        }
+    }
+    Serial.println("---------------------------------");
+}
+
+// Function to initialize GSM modem
+void initGSM() {
+    SerialMon.println("Initializing GSM modem...");
+    // A7670-GSM Reset
+    pinMode(RESET, OUTPUT);
+    digitalWrite(RESET, LOW); delay(100);
+    digitalWrite(RESET, HIGH); delay(100);
+    digitalWrite(RESET, LOW); delay(100);
+
+    // A7670-GSM Power
+    pinMode(PWR_PIN, OUTPUT);
+    digitalWrite(PWR_PIN, LOW); delay(100);
+    digitalWrite(PWR_PIN, HIGH); delay(100);
+    digitalWrite(PWR_PIN, LOW); delay(1000);  // Increased delay
+
+    Serial.println("Starting Serial Communications...");
+    SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+    
+    // Wait for the modem to initialize
+    delay(3000);
+
+    SerialMon.println("Connecting to cellular network...");
+    while (!gsmConnected && gsmRetryCount < maxRetries) {
+        if (!modem.gprsConnect(APN)) {
+            SerialMon.println("GPRS failed, retrying...");
+            gsmRetryCount++;
+            delay(2000);
+        } else {
+            gsmConnected = true;
+            SerialMon.println("GPRS connected");
+        }
+    }
+}
+
+// Function to connect to AWS IoT
+void connectToAWS() {
+    // Load TLS certificates
+    sslClient.setCACert(AWS_CERT_CA);
+    sslClient.setCertificate(AWS_CERT_CRT);
+    sslClient.setPrivateKey(AWS_CERT_PRIVATE);
+
+    mqttClient.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
+    mqttClient.setCallback(messageHandler);
+
+    if (!mqttClient.connected()) {
+        mqttRetryCount++;
+        SerialMon.println("Connecting to AWS IoT...");
+        if (mqttClient.connect(DEVICE_ID)) {
+            SerialMon.println("AWS IoT Connected.");
+            mqttRetryCount = 0;
+            reconnectDelay = 1000;
+
+            // Subscribe to all relevant topics
+            mqttClient.subscribe(AWS_IOT_DEVICE_ACTIVATION_TOPIC);
+            mqttClient.subscribe(AWS_IOT_DEVICE_COMMAND_TOPIC);
+            mqttClient.subscribe(AWS_IOT_DEVICE_WEATHER_TOPIC);
+
+            // Check activation status
+            deviceActivated = isDeviceActivated();
+                
+            // Publish a startup message
+            if (deviceActivated) {
+                publishUpdateStatus("Online", "Device connected and ready for updates");
+            } else {
+                publishUpdateStatus("Inactive", "Device connected but requires activation");
+            }
+
+        } else {
+          // Exponential backoff
+            Serial.printf("Failed, rc=%d. Retrying in %d ms\n", mqttClient.state(), reconnectDelay);
+            delay(reconnectDelay);
+            reconnectDelay = min(reconnectDelay * 2, maxReconnectDelay);
+        }
+    }
+    if (mqttRetryCount >= maxRetries) {
+        Serial.println("Maximum MQTT retries reached. Restarting ESP32.");
+        ESP.restart();
+    }
+    Serial.println("---------------------------------");
+}
+
+void setup() {
+  SerialMon.begin(115200);
+  delay(3000);
+  
+  // Generate unique device ID based on MAC address
+  getMacAddress(DEVICE_ID);
+
+  // Configure device-specific topics
+  sprintf(AWS_IOT_DEVICE_ACTIVATION_TOPIC, "kloudtrack/%s/activation", DEVICE_ID);
+  sprintf(AWS_IOT_DEVICE_COMMAND_TOPIC, "kloudtrack/%s/command", DEVICE_ID);
+  sprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, "kloudtrack/%s/data", DEVICE_ID);
+
+  Serial.println("\n---------------------------------");
+  Serial.println("ESP32 Weather Station with AWS IoT 2");
+  Serial.printf("Device ID: %s\n", DEVICE_ID);
+  Serial.printf("Current Firmware Version: %s\n", FIRMWARE_VERSION);
+  Serial.println("---------------------------------");
+
+  // Check activation status
+  deviceActivated = isDeviceActivated();
+  Serial.printf("Device activation status: %s\n", deviceActivated ? "ACTIVATED" : "NOT ACTIVATED");
+
+  // Initialize GSM modem and connect to MQTT
+  initGSM();
+  connectToAWS();
+  lastWeatherPublish = millis();
+}
+
+void loop() {  
+  unsigned long currentMillis = millis();
+
+  // Maintain GSM connection
+  if (!modem.isNetworkConnected()) {
+    Serial.println("Network disconnected. Reconnecting...");
+    initGSM();
+  }
+
+  // Maintain MQTT connection
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT disconnected. Reconnecting...");
+    connectToAWS();
+  }
+
+  // Process MQTT messages
+  mqttClient.loop();
+
+  // Publish weather data at regular intervals
+  if (currentMillis - lastWeatherPublish >= WEATHER_PUBLISH_INTERVAL) {
+      lastWeatherPublish = currentMillis;
+      if (deviceActivated) {
+          publishWeatherData();
+      }
+  }
+  delay(10);
+}

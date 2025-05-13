@@ -1,6 +1,7 @@
 {
     "files.associations": {
         ".css": "tailwindcss",
-        "new": "cpp"
+        "new": "cpp",
+        "*.tpp": "cpp"
     }
 }

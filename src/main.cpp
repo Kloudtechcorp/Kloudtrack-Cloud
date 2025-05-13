@@ -1,26 +1,24 @@
 #include <Arduino.h>
-#include <WiFi.h>
 #include <PubSubClient.h>
-#include <HTTPClient.h>
 #include <Update.h>
 #include "secrets.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <WiFiClientSecure.h>
+#include <esp_task_wdt.h>
 
 // MQTT Topics
 char AWS_IOT_DEVICE_COMMAND_TOPIC[50];
 char AWS_IOT_DEVICE_WEATHER_TOPIC[50];
-char AWS_IOT_DEVICE_ACTIVATION_TOPIC[50];
+char AWS_IOT_DEVICE_STATUS_TOPIC[50];
 
-// Current firmware version
-#define FIRMWARE_VERSION "1.3.0"
+// Device ID
+#define DEVICE_ID "KT-DEVICE-12345"
 
-// Activation key that admin must provide (should be unique per device)
-#define ACTIVATION_KEY "KT-SECURE-KEY-12345"
+// Firmware Version
+#define FIRMWARE_VERSION "1.3.1"
 
 // Weather data parameters
-#define WEATHER_PUBLISH_INTERVAL 60000  // Publish weather data every minute
+#define WEATHER_PUBLISH_INTERVAL 60000
 unsigned long lastWeatherPublish = 0;
 
 // Weather data ranges
@@ -33,25 +31,57 @@ unsigned long lastWeatherPublish = 0;
 #define MIN_WIND_SPEED 0.0
 #define MAX_WIND_SPEED 20.0
 
-WiFiClientSecure net = WiFiClientSecure();
-PubSubClient client(net);
+#define TINY_GSM_MODEM_SIM7600
+#include <TinyGsmClient.h>
+#include <SSLClient.h>
+#include <ArduinoHttpClient.h>
+
+// GSM Parameters
+#define UART_BAUD 115200
+#define PIN_DTR 25
+#define PIN_TX 26
+#define PIN_RX 27
+#define PWR_PIN 4
+#define PIN_RI 33
+#define RESET 5
+#define SerialMon Serial
+
+HardwareSerial SerialAT(1);
+TinyGsm modem(SerialAT);
+TinyGsmClient baseClient(modem);
+SSLClient sslClient(&baseClient);
+PubSubClient mqttClient(sslClient);
 Preferences preferences;
+
 bool deviceActivated = false;
-int wifiRetryCount = 0;
+bool gsmConnected = false;
+int gsmRetryCount = 0;
 int mqttRetryCount = 0;
 int maxRetries = 5;
+unsigned long reconnectDelay = 1000;
+const unsigned long maxReconnectDelay = 60000;
 
-// Add exponential backoff for connection attempts
-unsigned long reconnectDelay = 1000; // Start with 1 second
-const unsigned long maxReconnectDelay = 60000; // Cap at 1 minute
+// Function to get memory statistics
+void getMemoryStats(JsonObject& memoryStats) {
+    const float TOTAL_RAM = 327680.0;
+    const float TOTAL_FLASH = 1310720.0;
 
-// Device ID will be set based on MAC address
-char DEVICE_ID[20];
+    // RAM usage percent (used = total - free heap)
+    float used_ram = TOTAL_RAM - ESP.getFreeHeap();
+    memoryStats["ram_usage_percent"] = used_ram * 100.0 / TOTAL_RAM;
 
-// Function to get MAC address as a string
-void getMacAddress(char* macStr) {
-    uint64_t mac = ESP.getEfuseMac();
-    sprintf(macStr, "KT%08X", (uint32_t)mac);
+    // Flash usage percent
+    float flash_used = ESP.getSketchSize();
+    memoryStats["flash_usage_percent"] = flash_used * 100.0 / TOTAL_FLASH;
+}
+
+// Function to publish status updates
+void publishUpdateStatus(const char* status, const char* message) {
+    StaticJsonDocument<200> doc;
+    doc["status"] = status;
+    doc["message"] = message;
+      
+    Serial.printf("Published status: %s - %s\n", status, message);
 }
 
 // Function to check if device is activated
@@ -75,52 +105,330 @@ void activateDevice(bool activate) {
     doc["firmware_version"] = FIRMWARE_VERSION;
     doc["activated"] = activate;
     
-    char jsonBuffer[256];
-    serializeJson(doc, jsonBuffer);
+    String jsonStr;
+    serializeJson(doc, jsonStr);
     
     // Publish to device-specific activation topic
-    sprintf(AWS_IOT_DEVICE_ACTIVATION_TOPIC, "kloudtrack/%s/activation", DEVICE_ID);
-    client.publish(AWS_IOT_DEVICE_ACTIVATION_TOPIC, jsonBuffer);
+    mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonStr.c_str());
     
     Serial.printf("Device %s\n", activate ? "ACTIVATED" : "DEACTIVATED");
 }
 
-void getMemoryStats(JsonObject& memoryStats) {
-    // Set total sizes to match PlatformIO values
-    const float TOTAL_RAM = 327680.0;       // bytes
-    const float TOTAL_FLASH = 1310720.0;    // bytes
+void parseURL(const String &url, String &host, int &port, String &path) {
+  if (!url.startsWith("https://")) return;
 
-    // RAM usage percent (used = total - free heap)
-    float used_ram = TOTAL_RAM - ESP.getFreeHeap();
-    memoryStats["ram_usage_percent"] = used_ram * 100.0 / TOTAL_RAM;
+  int index = 8;  // after "https://"
+  int slashIndex = url.indexOf('/', index);
+  String hostPort = url.substring(index, slashIndex);
+  int colonIndex = hostPort.indexOf(':');
 
-    // Flash usage percent
-    float flash_used = ESP.getSketchSize();
-    memoryStats["flash_usage_percent"] = flash_used * 100.0 / TOTAL_FLASH;
+  if (colonIndex != -1) {
+    host = hostPort.substring(0, colonIndex);
+    port = hostPort.substring(colonIndex + 1).toInt();
+  } else {
+    host = hostPort;
+    port = 443;
+  }
+
+  path = url.substring(slashIndex);
+}
+
+// Add this function to your code to test the connection before attempting OTA
+bool testServerConnection(const String &host, int port) {
+  Serial.printf("[OTA] Testing connection to %s:%d\n", host.c_str(), port);
+  
+  // Reset SSL client state
+  sslClient.stop();
+  delay(500);
+  
+  // Set certificate
+  sslClient.setCACert(AWS_CERT_CA);
+  
+  unsigned long startTime = millis();
+  bool connected = false;
+  
+  // Print network info
+  Serial.print("[OTA] IP Address: ");
+  Serial.println(modem.localIP());
+  Serial.print("[OTA] Signal Quality: ");
+  Serial.println(modem.getSignalQuality());
+  
+  // Try to connect with timeout
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.printf("[OTA] Connection attempt %d...\n", attempt);
+    
+    if (sslClient.connect(host.c_str(), port)) {
+      connected = true;
+      Serial.printf("[OTA] Connected successfully in %lu ms\n", millis() - startTime);
+      break;
+    }
+    
+    Serial.println("[OTA] Connection failed, retrying...");
+    delay(1000 * attempt); // Exponential backoff
+  }
+  
+  if (!connected) {
+    Serial.printf("[OTA] Connection failed after %lu ms\n", millis() - startTime);
+    return false;
+  }
+  
+  // Send a simple HEAD request to check if server responds
+  sslClient.println("HEAD / HTTP/1.1");
+  sslClient.println("Host: " + String(host));
+  sslClient.println("Connection: close");
+  sslClient.println();
+  
+  // Wait for response with timeout
+  unsigned long timeout = millis();
+  while (millis() - timeout < 5000) {
+    if (sslClient.available()) {
+      String line = sslClient.readStringUntil('\n');
+      Serial.println("[OTA] Server response: " + line);
+      sslClient.stop();
+      return true;
+    }
+    delay(10);
+  }
+  
+  Serial.println("[OTA] No response from server");
+  sslClient.stop();
+  return false;
+}
+
+// Function to perform OTA update using GSM
+bool performOTAUpdate(const String &otaUrl) {
+  String host, path;
+  int port;
+
+  // Signal Quality Check
+  int csq = modem.getSignalQuality();
+  Serial.printf("Signal Quality: %d\n", csq);
+  if (csq < 10) {  // Signal too weak
+    publishUpdateStatus("Error", "Signal strength too low for update");
+    return false;
+  }
+
+  // Memory Check
+  Serial.printf("Memory: %d\n", ESP.getFreeHeap());
+  if (ESP.getFreeHeap() < 40000) {  // Need at least 40KB free
+    publishUpdateStatus("Error", "Insufficient memory for update");
+    return false;
+  }
+
+  publishUpdateStatus("OTA", "Starting OTA update process");
+
+  // Parse the URL
+  parseURL(otaUrl, host, port, path);
+  if (host.length() == 0 || path.length() == 0) {
+    Serial.println("[OTA] Invalid OTA URL");
+    publishUpdateStatus("Error", "Invalid OTA URL format");
+    return false;
+  }
+
+  Serial.printf("[OTA] Connecting to: %s:%d\n", host.c_str(), port);
+  publishUpdateStatus("OTA", "Connecting to update server");
+
+  // Test server connection before proceeding
+  if (!testServerConnection(host, port)) {
+    publishUpdateStatus("Error", "Failed to establish connection to update server");
+    return false;
+  }
+
+  // Reset the SSL client before creating HTTP client to ensure fresh connection
+  sslClient.stop();
+  delay(1000);
+  
+  // Set the certificates for the OTA server specifically
+  sslClient.setCACert(AWS_CERT_CA);
+
+  HttpClient http(sslClient, host, port);
+  http.setTimeout(10000); // 10 seconds timeout
+
+  http.connectionKeepAlive();
+  publishUpdateStatus("OTA", "Downloading firmware");
+  Serial.println("[OTA] Sending HTTP GET request");
+
+  // Send GET request with retry mechanism
+  int maxRetries = 3;
+  int err = -1;
+  
+  for (int retry = 0; retry < maxRetries; retry++) {
+    err = http.get(path);
+    if (err == 0) break;
+    
+    Serial.printf("[OTA] HTTP GET failed (attempt %d/%d): %d\n", 
+                 retry+1, maxRetries, err);
+    delay(1000 * (retry + 1)); // Exponential backoff
+  }
+  
+  if (err != 0) {
+    String errorMsg = "HTTP request failed: " + String(err);
+    publishUpdateStatus("Error", errorMsg.c_str());
+    return false;
+  }
+
+  int status = http.responseStatusCode();
+  Serial.printf("[OTA] HTTP status code: %d\n", status);
+
+  if (status <= 0) {
+    String errorMsg = "Invalid HTTP status: " + String(status);
+    publishUpdateStatus("Error", errorMsg.c_str());
+    return false;
+  }
+  
+  if (status != 200) {
+    String errorMsg = "HTTP error: " + String(status);
+    publishUpdateStatus("Error", errorMsg.c_str());
+    return false;
+  }
+
+  int contentLength = http.contentLength();
+  if (contentLength <= 0) {
+    Serial.println("[OTA] Invalid content length");
+    publishUpdateStatus("Error", "Invalid content length");
+    return false;
+  }
+
+  Serial.printf("[OTA] Update size: %d bytes\n", contentLength);
+
+  if (!Update.begin(contentLength)) {
+    Serial.println("[OTA] Update.begin() failed");
+    return false;
+  }
+
+  Serial.println("[OTA] Starting update...");
+  publishUpdateStatus("OTA", "Writing firmware to flash");
+
+  // Significantly increase buffer size (use 4KB or 8KB if memory allows)
+  const size_t bufferSize = 4096;  // 4KB buffer instead of 512 bytes
+  uint8_t *buff = (uint8_t*)malloc(bufferSize);
+
+  if (!buff) {
+    Serial.println("[OTA] Failed to allocate buffer memory");
+    publishUpdateStatus("Error", "Memory allocation failed");
+    Update.abort();
+    return false;
+  }
+
+  size_t written = 0;
+  uint32_t lastProgress = 0;
+  uint32_t startTime = millis();
+  
+  // Read with timeout protection
+  unsigned long readTimeout = 15000; // 15 second timeout for reads
+  unsigned long lastRead = millis();
+  
+  while (http.connected() && written < contentLength) {
+    // Check for read timeout
+    if (millis() - lastRead > readTimeout) {
+      Serial.println("[OTA] Read timeout");
+      publishUpdateStatus("Error", "Download timeout");
+      free(buff);
+      Update.abort();
+      return false;
+    }
+
+    esp_task_wdt_reset(); // Reset watchdog during long download
+    
+    int available = http.available();
+    if (available > 0) {
+      lastRead = millis(); // Reset timeout counter
+      
+      // Read up to buffer size
+      size_t toRead = min(available, (int)bufferSize);
+      int readBytes = http.read(buff, toRead);
+      
+      if (readBytes > 0) {
+        // Write to Update
+        if (Update.write(buff, readBytes) != readBytes) {
+          Serial.printf("[OTA] Write failed: %s\n", Update.errorString());
+          free(buff);
+          Update.abort();
+          return false;
+        }
+        
+        written += readBytes;
+        
+        // Report progress every 5%
+        uint32_t progress = (written * 100) / contentLength;
+        if (progress - lastProgress >= 5 || progress == 100) {
+          lastProgress = progress;
+          Serial.printf("[OTA] Progress: %d%%\n", progress);
+        }
+        
+        // Small delay to allow background tasks (WiFi/GSM stack, etc.)
+        delay(1);
+      }
+    } else if (available == 0) {
+      // No data available, give the GSM modem time to process
+      delay(10);
+    }
+  }
+  
+  free(buff); // Free the buffer
+  
+  uint32_t updateTime = (millis() - startTime) / 1000;
+  Serial.printf("[OTA] Download completed in %d seconds\n", updateTime);
+  
+  if (written != contentLength) {
+    Serial.printf("[OTA] Size mismatch: %d != %d\n", written, contentLength);
+    publishUpdateStatus("Error", "Size mismatch in downloaded firmware");
+    Update.abort();
+    return false;
+  }
+
+  Serial.println("[OTA] Finishing update...");
+  publishUpdateStatus("OTA", "Finalizing firmware update");
+  
+  if (!Update.end()) {
+    Serial.printf("[OTA] Update.end() failed: %s\n", Update.errorString());
+    return false;
+  }
+
+  if (!Update.isFinished()) {
+    Serial.println("[OTA] Update not finished correctly");
+    publishUpdateStatus("Error", "Update process incomplete");
+    return false;
+  }
+
+  Serial.println("[OTA] Update successful! Rebooting...");
+  publishUpdateStatus("Success", "Update complete, rebooting device");
+  
+  // Add a delay to ensure the final status message is sent
+  delay(1000);
+  
+  // Restart ESP32 to apply the new firmware
+  ESP.restart();
+  
+  return true; // This won't be reached due to restart
 }
 
 
-// Function to publish status updates
-void publishUpdateStatus(const char* status, const char* message) {
-    StaticJsonDocument<200> doc;
-    doc["device_id"] = DEVICE_ID;
-    doc["firmware_version"] = FIRMWARE_VERSION;
-    doc["status"] = status;
-    doc["message"] = message;
-    doc["activated"] = deviceActivated;
-    
-    // Add memory statistics
-    JsonObject memoryStats = doc.createNestedObject("memory");
-    getMemoryStats(memoryStats);
-    
-    char jsonBuffer[512];
-    serializeJson(doc, jsonBuffer);
-    
-    // Publish to device-specific status topic
-    sprintf(AWS_IOT_DEVICE_COMMAND_TOPIC, "kloudtrack/%s/command", DEVICE_ID);
-    client.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonBuffer);
-    
-    Serial.printf("Published status: %s - %s\n", status, message);
+// Handle Update Command
+void handleUpdateCommand(const JsonDocument& doc) {
+    // Check if device is activated
+    if (!deviceActivated) {
+        Serial.println("OTA update rejected: Device not activated");
+        publishUpdateStatus("Rejected", "Device not activated");
+        return;
+    }
+
+    if (!doc.containsKey("otaUrl")) {
+        publishUpdateStatus("Error", "Missing otaUrl");
+        return;
+    }
+
+    String otaUrl = doc["otaUrl"].as<String>();
+    String newVersion = doc.containsKey("version") ? doc["version"].as<String>() : FIRMWARE_VERSION;
+    bool forceUpdate = doc.containsKey("force") ? doc["force"].as<bool>() : false;
+
+    if (!forceUpdate && newVersion == FIRMWARE_VERSION) {
+        publishUpdateStatus("Ignored", "Same firmware version. Update skipped.");
+        return;
+    }
+
+    publishUpdateStatus("Starting", "Beginning OTA update...");
+    performOTAUpdate(otaUrl.c_str());
 }
 
 // Function to generate random weather data and publish it
@@ -159,180 +467,27 @@ void publishWeatherData() {
     serializeJson(doc, jsonBuffer, msgLen);
     
     // Publish to device-specific weather topic
-    sprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, "kloudtrack/%s/data", DEVICE_ID);
-    client.publish(AWS_IOT_DEVICE_WEATHER_TOPIC, jsonBuffer);
+    // sprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, "kloudtrack/%s/data", DEVICE_ID);
+    mqttClient.publish(AWS_IOT_DEVICE_WEATHER_TOPIC, jsonBuffer);
     delete[] jsonBuffer;
 }
 
-// Function to perform OTA update
-bool performOTAUpdate(const char* url, const char* expectedChecksum) {
-    // Check if device is activated
-    if (!deviceActivated) {
-        Serial.println("OTA update rejected: Device not activated");
-        publishUpdateStatus("Rejected", "Device not activated");
-        return false;
-    }
+// Function to generate Status Report
+void publishStatusReport() {
+    StaticJsonDocument<200> doc;
+    doc["device_id"] = DEVICE_ID;
+    doc["firmware_version"] = FIRMWARE_VERSION;
+    doc["activated"] = deviceActivated;
 
-    HTTPClient http;
-    bool success = false;
-    
-    // Start the OTA update process
-    Serial.println("Attempting to download firmware...");
-    publishUpdateStatus("Downloading", "Starting firmware download");
+    // Add memory statistics
+    JsonObject memoryStats = doc.createNestedObject("memory");
+    getMemoryStats(memoryStats);
 
-    http.begin(net, url);
-    http.addHeader("Content-Type", "application/octet-stream");
+    String jsonStr;
+    serializeJson(doc, jsonStr);
 
-    int httpCode = http.GET();
-
-    if (httpCode == HTTP_CODE_OK) {
-        WiFiClient* stream = http.getStreamPtr();
-        size_t total = http.getSize();
-
-        // Prepare for OTA update
-        if (Update.begin(total)) {
-            size_t written = 0;
-            
-            // Read and write the stream
-            uint8_t buffer[1024];
-            while (http.connected() && (written < total)) {
-                size_t available = stream->available();
-                if (available) {
-                    size_t bytesRead = stream->readBytes(buffer, min(available, sizeof(buffer)));
-                    size_t bytesWritten = Update.write(buffer, bytesRead);
-                    if (bytesWritten > 0) {
-                        written += bytesWritten;
-                        // Log progress (every 10%)
-                        if (written % (total / 10) < 1024) {
-                            Serial.printf("Progress: %d%%\n", (written * 100) / total);
-                            char progressMsg[32];
-                            sprintf(progressMsg, "Progress: %d%%", (written * 100) / total);
-                            publishUpdateStatus("Downloading", progressMsg);
-                        }
-                    } else {
-                        Serial.println("Error writing update");
-                        publishUpdateStatus("Failed", "Error writing update");
-                        break;
-                    }
-                }
-                delay(1);
-            }
-
-            // Check if the update is complete
-            if (written == total) {
-                Serial.println("Firmware download complete, verifying...");
-                publishUpdateStatus("Verifying", "Firmware download complete, verifying");
-                
-                // Verify update before finalizing
-                if (Update.end()) {
-                    if (Update.isFinished()) {
-                        Serial.println("OTA Update successful, restarting...");
-                        publishUpdateStatus("Success", "Update successful, restarting");
-                        success = true;
-                        // Give MQTT message time to send before restart
-                        delay(1000);
-                    } else {
-                        Serial.println("OTA Update not finished");
-                        publishUpdateStatus("Failed", "Update not finished properly");
-                    }
-                } else {
-                    Serial.printf("Error during update finalization: %d\n", Update.getError());
-                    publishUpdateStatus("Failed", "Error during update finalization");
-                }
-            } else {
-                Serial.println("Firmware size mismatch");
-                publishUpdateStatus("Failed", "Firmware size mismatch");
-                Update.abort();
-            }
-        } else {
-            Serial.println("Not enough space for update");
-            publishUpdateStatus("Failed", "Not enough space for update");
-        }
-    } else {
-        Serial.printf("HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
-        char errorMsg[64];
-        sprintf(errorMsg, "HTTP error: %d", httpCode);
-        publishUpdateStatus("Failed", errorMsg);
-    }
-
-    http.end();
-    return success;
-}
-
-// Handle activation commands
-void handleActivationCommand(const JsonDocument& doc) {
-    const char* action = doc["action"];
-    const char* key = doc["key"];
-    
-    if (!action) {
-        Serial.println("Invalid activation command: missing action");
-        return;
-    }
-    
-    if (strcmp(action, "activate") == 0) {
-        // Check if key is correct
-        if (!key || strcmp(key, ACTIVATION_KEY) != 0) {
-            Serial.println("Activation rejected: Invalid key");
-            publishUpdateStatus("Access_denied", "Invalid activation key");
-            return;
-        }
-        
-        activateDevice(true);
-        Serial.println("Device activated successfully");
-        publishUpdateStatus("Activated", "Device activated successfully");
-    } 
-    else if (strcmp(action, "deactivate") == 0) {
-        // Check if key is correct
-        if (!key || strcmp(key, ACTIVATION_KEY) != 0) {
-            Serial.println("Deactivation rejected: Invalid key");
-            publishUpdateStatus("Access_denied", "Invalid activation key");
-            return;
-        }
-        
-        activateDevice(false);
-        Serial.println("Device deactivated");
-        publishUpdateStatus("Deactivated", "Device deactivated");
-    }
-    else {
-        Serial.println("Unknown activation action");
-    }
-    Serial.println("---------------------------------");
-}
-
-// Handle update commands
-void handleUpdateCommand(const JsonDocument& doc) {
-    // Check if device is activated before proceeding
-    if (!deviceActivated) {
-        Serial.println("Update command rejected: Device not activated");
-        publishUpdateStatus("Rejected", "Device not activated");
-        return;
-    }
-    
-    const char* version = doc["version"];
-    const char* url = doc["url"];
-    const char* checksum = doc["checksum"];
-    bool force = doc["force"] | false;
-    
-    // Check if we need to update
-    if (!version || !url) {
-        publishUpdateStatus("Error", "Missing version or URL in update command");
-        return;
-    }
-    
-    // Compare versions
-    if (strcmp(version, FIRMWARE_VERSION) == 0 && !force) {
-        Serial.println("Already running this version, update skipped");
-        publishUpdateStatus("Skipped", "Already running the requested version");
-        return;
-    }
-    
-    Serial.printf("Starting update to version %s from %s\n", version, url);
-    publishUpdateStatus("Started", "Starting firmware update");
-    
-    // Perform the update
-    if (performOTAUpdate(url, checksum)) {
-        ESP.restart();
-    }
+    // Publish to device-specific status topic
+    mqttClient.publish(AWS_IOT_DEVICE_STATUS_TOPIC, jsonStr.c_str());
 }
 
 // MQTT message handler
@@ -358,25 +513,16 @@ void messageHandler(char* topic, byte* payload, unsigned int length) {
     }
 
     // Handle based on topic
-    if (strcmp(topic, AWS_IOT_DEVICE_ACTIVATION_TOPIC) == 0) {
-        handleActivationCommand(doc);
-    }
-    // else if (strcmp(topic, AWS_IOT_DEVICE_WEATHER_TOPIC) == 0) {
-    //     // Force publish weather data when requested
-    //     publishWeatherData();
-    //     // publishUpdateStatus("Info", "Weather data published on demand");
-    // }
-    else if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0) {
-        const char* command = doc["command"];
-        
-        if (command && strcmp(command, "update") == 0) {
-            handleUpdateCommand(doc);
-        } 
-        else if (command && strcmp(command, "status") == 0) {
+    if (strcmp(topic, AWS_IOT_DEVICE_STATUS_TOPIC) == 0) {
+        // Check for status request
+        if (doc.containsKey("status") && doc["status"].as<bool>()) {
             // Respond with current status when requested
-            publishUpdateStatus("Info", "Status report requested");
+            publishStatusReport();
         }
-        else if (command && strcmp(command, "reset") == 0) {
+    }
+    else if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0) {
+        // Handle device reset
+        if (doc.containsKey("reset") && doc["reset"].as<bool>()) {
             // Publish notification that device is restarting
             publishUpdateStatus("Resetting", "Device restarting per command request");
             
@@ -388,77 +534,107 @@ void messageHandler(char* topic, byte* payload, unsigned int length) {
             // Restart the ESP32
             ESP.restart();
         }
-        else {
-            Serial.println("No command received");
+        // Handle device activation
+        else if (doc.containsKey("activate")) {
+            bool activateState = doc["activate"].as<bool>();
+            
+            // Set activation state based on the boolean value
+            activateDevice(activateState);
+            
+            if (activateState) {
+                Serial.println("Device activated successfully");
+                publishUpdateStatus("Activated", "Device activated successfully");
+            } else {
+                Serial.println("Device deactivated");
+                publishUpdateStatus("Deactivated", "Device deactivated");
+            }
+        }
+        // Handle OTA update command
+        else if (doc.containsKey("update") && doc["update"].as<bool>() == true) {
+            if (doc.containsKey("otaUrl")) {
+                // Optional: allow version and force update flags
+                handleUpdateCommand(doc);
+            } else {
+                publishUpdateStatus("Error", "Missing otaUrl for update");
+            }
         }
     }
     Serial.println("---------------------------------");
 }
 
-void connectWiFi() {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.print("Connecting to WiFi");
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-        unsigned long wifiStart = millis();
-        while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart < 10000)) {
-          delay(500);
-          Serial.print(".");
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-          Serial.println("\nWiFi connected!");
-          wifiRetryCount = 0;
-        } else {
-          wifiRetryCount++;
-          Serial.printf("\nWiFi connection failed. Attempt %d/%d\n", wifiRetryCount, maxRetries);
-        }
-        if (wifiRetryCount >= maxRetries) {
-          Serial.println("Maximum WiFi retries reached. Restarting ESP32.");
-          ESP.restart();
-        }
-    }
-    Serial.println("---------------------------------");
-}
+// Function to initialize GSM modem
+void initGSM() {
+    SerialMon.println("Initializing GSM modem...");
+    // A7670-GSM Reset
+    pinMode(RESET, OUTPUT);
+    digitalWrite(RESET, LOW); delay(100);
+    digitalWrite(RESET, HIGH); delay(100);
+    digitalWrite(RESET, LOW); delay(100);
 
-void connectToAWS() {
-    // Configure WiFiClientSecure to use the AWS IoT device credentials
-    net.setCACert(AWS_CERT_CA);
-    net.setCertificate(AWS_CERT_CRT);
-    net.setPrivateKey(AWS_CERT_PRIVATE);
+    // A7670-GSM Power
+    pinMode(PWR_PIN, OUTPUT);
+    digitalWrite(PWR_PIN, LOW); delay(100);
+    digitalWrite(PWR_PIN, HIGH); delay(100);
+    digitalWrite(PWR_PIN, LOW); delay(1000);  // Increased delay
 
-    // Connect to the MQTT broker on AWS IoT
-    client.setServer(AWS_IOT_ENDPOINT, 8883);
-    client.setCallback(messageHandler);
-
-    Serial.println("Connecting to AWS IoT Core...");
+    Serial.println("Starting Serial Communications...");
+    SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
     
-    if (!client.connected()) {
-        mqttRetryCount++;
-        Serial.printf("Connecting to AWS IoT. Attempt %d/%d\n", mqttRetryCount, maxRetries);
+    // Wait for the modem to initialize
+    delay(3000);
 
-        if (client.connect(DEVICE_ID)) {
-            Serial.println("Connected!");
+    Serial.println("Connecting to cellular network...");
+    unsigned long gsmReconnectDelay = 1000;
+    while (!gsmConnected && gsmRetryCount < maxRetries) {
+        if (!modem.gprsConnect(APN)) {
+            gsmReconnectDelay = min(gsmReconnectDelay * 2, maxReconnectDelay);
+            Serial.printf("GPRS failed, retrying in %lu ms...\n", gsmReconnectDelay);
+            delay(gsmReconnectDelay);
+            gsmRetryCount++;
+        } else {
+            gsmConnected = true;
+        }
+    }
+}
+
+// Function to connect to AWS IoT
+void connectToAWS() {
+    SerialMon.println("Connecting to AWS IoT...");
+    mqttClient.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
+    mqttClient.setCallback(messageHandler);
+
+    if (!sslClient.connected()) {
+      // Only set certs if SSL connection is fresh
+      sslClient.setCACert(AWS_CERT_CA);
+      sslClient.setCertificate(AWS_CERT_CRT);
+      sslClient.setPrivateKey(AWS_CERT_PRIVATE);
+    }
+
+    if (!mqttClient.connected()) {
+        mqttRetryCount++;
+        
+        if (mqttClient.connect(DEVICE_ID)) {
+            SerialMon.println("AWS IoT Connected.");
             mqttRetryCount = 0;
             reconnectDelay = 1000;
-            
+
             // Subscribe to all relevant topics
-            client.subscribe(AWS_IOT_DEVICE_ACTIVATION_TOPIC);
-            client.subscribe(AWS_IOT_DEVICE_COMMAND_TOPIC);
-            client.subscribe(AWS_IOT_DEVICE_WEATHER_TOPIC);
-            
+            mqttClient.subscribe(AWS_IOT_DEVICE_STATUS_TOPIC);
+            mqttClient.subscribe(AWS_IOT_DEVICE_COMMAND_TOPIC);
+            mqttClient.subscribe(AWS_IOT_DEVICE_WEATHER_TOPIC);
+
             // Check activation status
             deviceActivated = isDeviceActivated();
-            
+                
             // Publish a startup message
-            if (deviceActivated) {
-                publishUpdateStatus("Online", "Device connected and ready for updates");
-            } else {
-                publishUpdateStatus("Inactive", "Device connected but requires activation");
-            }
+            publishUpdateStatus(deviceActivated ? "Online" : "Inactive", 
+                                deviceActivated ? "Ready for updates" : "Requires activation");
+
         } else {
             // Exponential backoff
-            Serial.printf("Failed, rc=%d. Retrying in %d ms\n", client.state(), reconnectDelay);
-            delay(reconnectDelay);
             reconnectDelay = min(reconnectDelay * 2, maxReconnectDelay);
+            Serial.printf("MQTT connect failed, retrying in %lu ms\n", reconnectDelay);
+            delay(reconnectDelay);
         }
     }
     if (mqttRetryCount >= maxRetries) {
@@ -469,57 +645,55 @@ void connectToAWS() {
 }
 
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    
-    // Generate unique device ID based on MAC address
-    getMacAddress(DEVICE_ID);
-    
-    // Configure device-specific topics
-    sprintf(AWS_IOT_DEVICE_ACTIVATION_TOPIC, "kloudtrack/%s/activation", DEVICE_ID);
-    sprintf(AWS_IOT_DEVICE_COMMAND_TOPIC, "kloudtrack/%s/command", DEVICE_ID);
-    sprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, "kloudtrack/%s/data", DEVICE_ID);
+    esp_task_wdt_init(30, true); // 30s watchdog
+    SerialMon.begin(115200);
+    delay(3000);
 
-    Serial.println("\n\n---------------------------------");
-    Serial.println("ESP32 Weather Station with AWS IoT 2");
+    // Configure device-specific topics
+    snprintf(AWS_IOT_DEVICE_COMMAND_TOPIC, 50, "kloudtrack/%s/command", DEVICE_ID);
+    snprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, 50, "kloudtrack/%s/data", DEVICE_ID);
+    snprintf(AWS_IOT_DEVICE_STATUS_TOPIC, 50, "kloudtrack/%s/status", DEVICE_ID);
+
+    Serial.println("\n---------------------------------");
+    Serial.println("ESP32 Weather Station");
     Serial.printf("Device ID: %s\n", DEVICE_ID);
     Serial.printf("Current Firmware Version: %s\n", FIRMWARE_VERSION);
     Serial.println("---------------------------------");
-
-    // Connect to WiFi
-    connectWiFi();
 
     // Check activation status
     deviceActivated = isDeviceActivated();
     Serial.printf("Device activation status: %s\n", deviceActivated ? "ACTIVATED" : "NOT ACTIVATED");
 
-    // Connect to AWS IoT
+    // Initialize GSM modem and connect to MQTT
+    initGSM();
     connectToAWS();
     lastWeatherPublish = millis();
 }
 
-void loop() {
-    unsigned long currentMillis = millis();
+void loop() {  
+  esp_task_wdt_reset();
+  unsigned long currentMillis = millis();
 
-    // Maintain WiFi connection
-    if (WiFi.status() != WL_CONNECTED) {
-        connectWiFi();
-    }
+  // Maintain GSM connection
+  if (!modem.isNetworkConnected()) {
+    Serial.println("Network disconnected. Reconnecting...");
+    initGSM();
+  }
 
-    // Maintain MQTT connection
-    if (!client.connected()) {
-        connectToAWS();
-    }
-    
-    // Process MQTT messages
-    client.loop();
+  // Maintain MQTT connection
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT disconnected. Reconnecting...");
+    connectToAWS();
+  }
 
-    // Publish weather data at regular intervals
-    if (currentMillis - lastWeatherPublish >= WEATHER_PUBLISH_INTERVAL) {
-        lastWeatherPublish = currentMillis;
-        if (deviceActivated) {
-            publishWeatherData();
-        }
-    }
-    delay(10);
+  // Process MQTT messages
+  mqttClient.loop();
+
+  // Publish weather data at regular intervals
+  if (currentMillis - lastWeatherPublish >= WEATHER_PUBLISH_INTERVAL) {
+      lastWeatherPublish = currentMillis;
+      if (deviceActivated) {
+          publishWeatherData();
+      }
+  }
 }

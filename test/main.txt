@@ -5,8 +5,6 @@
   - upon reconnection, data will be sent to IoT Core
   - Data will be deleted upon being transferred
 */ 
-
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -442,65 +440,65 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
       // Respond with current status when requested
       publishStatusReport();
     }
-    else if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0)
+  }
+  else if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0)
+  {
+    // Handle device reset
+    if (doc.containsKey("reset") && doc["reset"].as<bool>())
     {
-      // Handle device reset
-      if (doc.containsKey("reset") && doc["reset"].as<bool>())
+      // Publish notification that device is restarting
+      publishUpdateStatus("Resetting", "Device restarting per command request");
+
+      Serial.println("Reset command received. Restarting device...");
+
+      // Give time for the MQTT message to be sent
+      delay(1000);
+
+      // Restart the ESP32
+      ESP.restart();
+    }
+    // Handle device activation
+    else if (doc.containsKey("activate"))
+    {
+      bool activateState = doc["activate"].as<bool>();
+
+      // Set activation state based on the boolean value
+      activateDevice(activateState);
+
+      if (activateState)
       {
-        // Publish notification that device is restarting
-        publishUpdateStatus("Resetting", "Device restarting per command request");
-
-        Serial.println("Reset command received. Restarting device...");
-
-        // Give time for the MQTT message to be sent
-        delay(1000);
-
-        // Restart the ESP32
-        ESP.restart();
+        Serial.println("Device activated successfully");
+        publishUpdateStatus("Activated", "Device activated successfully");
       }
-      // Handle device activation
-      else if (doc.containsKey("activate"))
+      else
       {
-        bool activateState = doc["activate"].as<bool>();
-
-        // Set activation state based on the boolean value
-        activateDevice(activateState);
-
-        if (activateState)
-        {
-          Serial.println("Device activated successfully");
-          publishUpdateStatus("Activated", "Device activated successfully");
-        }
-        else
-        {
-          Serial.println("Device deactivated");
-          publishUpdateStatus("Deactivated", "Device deactivated");
-        }
+        Serial.println("Device deactivated");
+        publishUpdateStatus("Deactivated", "Device deactivated");
       }
-      // Handle OTA update command
-      else if (doc.containsKey("update") && doc["update"].as<bool>() == true)
+    }
+    // Handle OTA update command
+    else if (doc.containsKey("update") && doc["update"].as<bool>() == true)
+    {
+      if (doc.containsKey("otaUrl"))
       {
-        if (doc.containsKey("otaUrl"))
-        {
-          // Optional: allow version and force update flags
-          handleUpdateCommand(doc);
-        }
-        else
-        {
-          publishUpdateStatus("Error", "Missing otaUrl for update");
-        }
+        // Optional: allow version and force update flags
+        handleUpdateCommand(doc);
       }
-      // Handle force sync command
-      else if (doc.containsKey("sync") && doc["sync"].as<bool>() == true)
+      else
       {
-        if (syncOfflineData())
-        {
-          publishUpdateStatus("Synced", "Offline data synchronized successfully");
-        }
-        else
-        {
-          publishUpdateStatus("Sync Failed", "Failed to synchronize offline data");
-        }
+        publishUpdateStatus("Error", "Missing otaUrl for update");
+      }
+    }
+    // Handle force sync command
+    else if (doc.containsKey("sync") && doc["sync"].as<bool>() == true)
+    {
+      if (syncOfflineData())
+      {
+        publishUpdateStatus("Synced", "Offline data synchronized successfully");
+      }
+      else
+      {
+        publishUpdateStatus("Sync Failed", "Failed to synchronize offline data");
       }
     }
   }

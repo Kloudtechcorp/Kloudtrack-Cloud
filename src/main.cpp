@@ -5,8 +5,6 @@
   - upon reconnection, data will be sent to IoT Core
   - Data will be deleted upon being transferred
 */ 
-
-
 #include <Arduino.h>
 #include <PubSubClient.h>
 #include <Update.h>
@@ -27,7 +25,7 @@ char AWS_IOT_DEVICE_STATUS_TOPIC[50];
 #define DEVICE_ID "KT-DEVICE-12345"
 
 // Current firmware version
-#define FIRMWARE_VERSION "1.3.0"
+#define FIRMWARE_VERSION "2.3.1"
 
 // Weather data parameters
 #define WEATHER_PUBLISH_INTERVAL 60000
@@ -106,37 +104,6 @@ String generateWeatherDataJson();
 void checkAndSyncData();
 String getNextDataFilename();
 bool deleteDataFile(const String &filename);
-
-// Function to get memory statistics
-void getDeviceStats(JsonObject &deviceStats)
-{
-  const float TOTAL_RAM = 327680.0;
-  const float TOTAL_FLASH = 1310720.0;
-
-  // RAM usage percent (used = total - free heap)
-  float used_ram = TOTAL_RAM - ESP.getFreeHeap();
-  deviceStats["ram_usage_percent"] = used_ram * 100.0 / TOTAL_RAM;
-
-  // Flash usage percent
-  float flash_used = ESP.getSketchSize();
-  deviceStats["flash_usage_percent"] = flash_used * 100.0 / TOTAL_FLASH;
-
-  // IP Address
-  deviceStats["ip_address"] = modem.localIP();
-
-  // Signal Quality
-  deviceStats["signal_quality"] = modem.getSignalQuality();
-
-  // Battery Status
-  deviceStats["battery"] = modem.getBattVoltage();
-
-  // SD Card status and storage
-  deviceStats["sd_card"] = sdCardAvailable ? "Available" : "Not available";
-  if (sdCardAvailable)
-  {
-    deviceStats["pending_records"] = pendingRecords;
-  }
-}
 
 // Function to publish status updates
 void publishUpdateStatus(const char *status, const char *message)
@@ -552,14 +519,37 @@ void publishWeatherData()
 // Function to generate status report
 void publishStatusReport()
 {
-  StaticJsonDocument<200> doc;
+  const float TOTAL_RAM = 327680.0;
+  const float TOTAL_FLASH = 1310720.0;
+
+  // RAM usage percent (used = total - free heap)
+  float used_ram = TOTAL_RAM - ESP.getFreeHeap();
+  float RAM_USAGE = used_ram * 100.0 / TOTAL_RAM;
+
+  // Flash usage percent
+  float flash_used = ESP.getSketchSize();
+  float FLASH_USAGE = flash_used * 100.0 / TOTAL_FLASH;
+
+  // Signal Quality
+  int SIGNAL_QUALITY = modem.getSignalQuality();
+
+  // SD Card status and storage
+  const char* SD_CARD = sdCardAvailable ? "Available" : "Not available";
+  int PENDING_RECORDS;
+  if (sdCardAvailable)
+  {
+    PENDING_RECORDS = pendingRecords;
+  }
+
+  StaticJsonDocument<256> doc;
   doc["device_id"] = DEVICE_ID;
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["activated"] = deviceActivated;
-
-  // Add memory statistics
-  JsonObject deviceStats = doc.createNestedObject("memory");
-  getDeviceStats(deviceStats);
+  doc["ram_usage"] = RAM_USAGE;
+  doc["flash_usage"] = FLASH_USAGE;
+  doc["signal_quality"] = SIGNAL_QUALITY;
+  doc["sd_card"] = SD_CARD;
+  doc["pending_records"] = PENDING_RECORDS;
 
   String jsonStr;
   serializeJson(doc, jsonStr);
@@ -599,70 +589,71 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
     if (doc.containsKey("status") && doc["status"].as<bool>())
     {
       // Respond with current status when requested
+      Serial.println("Status command received.");
       publishStatusReport();
     }
-  }
-  else if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0)
-  {
-    // Handle device reset
-    if (doc.containsKey("reset") && doc["reset"].as<bool>())
+    else if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0)
     {
-      // Publish notification that device is restarting
-      publishUpdateStatus("Resetting", "Device restarting per command request");
+      // Handle device reset
+      if (doc.containsKey("reset") && doc["reset"].as<bool>())
+      {
+        // Publish notification that device is restarting
+        publishUpdateStatus("Resetting", "Device restarting per command request");
 
-      Serial.println("Reset command received. Restarting device...");
+        Serial.println("Reset command received. Restarting device...");
 
-      // Give time for the MQTT message to be sent
-      delay(1000);
+        // Give time for the MQTT message to be sent
+        delay(1000);
 
-      // Restart the ESP32
-      ESP.restart();
+        // Restart the ESP32
+        ESP.restart();
+      }
+      // Handle device activation
+      else if (doc.containsKey("activate"))
+      {
+        bool activateState = doc["activate"].as<bool>();
+
+        // Set activation state based on the boolean value
+        activateDevice(activateState);
+
+        if (activateState)
+        {
+          Serial.println("Device activated successfully");
+          publishUpdateStatus("Activated", "Device activated successfully");
+        }
+        else
+        {
+          Serial.println("Device deactivated");
+          publishUpdateStatus("Deactivated", "Device deactivated");
+        }
+      }
+      // Handle OTA update command
+      else if (doc.containsKey("update") && doc["update"].as<bool>() == true)
+      {
+        if (doc.containsKey("url"))
+        {
+          // Optional: allow version and force update flags
+          handleUpdateCommand(doc);
+        }
+        else
+        {
+          publishUpdateStatus("Error", "Missing url for update");
+        }
+      }
+      // Handle force sync command
+      else if (doc.containsKey("sync") && doc["sync"].as<bool>() == true)
+      {
+        if (syncOfflineData())
+        {
+          publishUpdateStatus("Synced", "Offline data synchronized successfully");
+        }
+        else
+        {
+          publishUpdateStatus("Sync Failed", "Failed to synchronize offline data");
+        }
+      }
     }
-    // Handle device activation
-    else if (doc.containsKey("activate"))
-    {
-      bool activateState = doc["activate"].as<bool>();
-
-      // Set activation state based on the boolean value
-      activateDevice(activateState);
-
-      if (activateState)
-      {
-        Serial.println("Device activated successfully");
-        publishUpdateStatus("Activated", "Device activated successfully");
-      }
-      else
-      {
-        Serial.println("Device deactivated");
-        publishUpdateStatus("Deactivated", "Device deactivated");
-      }
-    }
-    // Handle OTA update command
-    else if (doc.containsKey("update") && doc["update"].as<bool>() == true)
-    {
-      if (doc.containsKey("otaUrl"))
-      {
-        // Optional: allow version and force update flags
-        handleUpdateCommand(doc);
-      }
-      else
-      {
-        publishUpdateStatus("Error", "Missing otaUrl for update");
-      }
-    }
-    // Handle force sync command
-    else if (doc.containsKey("sync") && doc["sync"].as<bool>() == true)
-    {
-      if (syncOfflineData())
-      {
-        publishUpdateStatus("Synced", "Offline data synchronized successfully");
-      }
-      else
-      {
-        publishUpdateStatus("Sync Failed", "Failed to synchronize offline data");
-      }
-    }
-  }
+  } 
   Serial.println("---------------------------------");
 }
 
@@ -757,9 +748,9 @@ void connectToAWS()
         reconnectDelay = 1000;
 
         // Subscribe to all relevant topics
-        mqttClient.subscribe(AWS_IOT_DEVICE_STATUS_TOPIC);
         mqttClient.subscribe(AWS_IOT_DEVICE_COMMAND_TOPIC);
         mqttClient.subscribe(AWS_IOT_DEVICE_WEATHER_TOPIC);
+        mqttClient.subscribe(AWS_IOT_DEVICE_STATUS_TOPIC);
 
         // Check activation status
         deviceActivated = isDeviceActivated();

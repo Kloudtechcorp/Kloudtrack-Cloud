@@ -5,7 +5,9 @@
 
 const char WIFI_SSID[] = "KT 2.4";
 const char WIFI_PASSWORD[] = "J@yGsumm!t";
+const char APN[] = "internet";
 const char AWS_IOT_ENDPOINT[] = "a68bn74ibyvu1-ats.iot.ap-southeast-1.amazonaws.com";
+const int AWS_IOT_PORT = 8883;
 
 // Amazon Root CA 1
 static const char AWS_CERT_CA[] PROGMEM = R"EOF(

@@ -68,7 +68,6 @@ unsigned long lastSyncAttempt = 0;
 int pendingRecords = 0;
 
 // Functions
-void getDeviceStats(JsonObject &deviceStats);
 void publishUpdateStatus(const char *status, const char *message);
 bool isDeviceActivated();
 void activateDevice(bool activate);
@@ -86,32 +85,6 @@ String generateWeatherDataJson();
 void checkAndSyncData();
 String getNextDataFilename();
 bool deleteDataFile(const String &filename);
-
-// Function to get memory statistics
-void getDeviceStats(JsonObject &deviceStats)
-{
-  const float TOTAL_RAM = 327680.0;
-  const float TOTAL_FLASH = 1310720.0;
-
-  // RAM usage percent (used = total - free heap)
-  float used_ram = TOTAL_RAM - ESP.getFreeHeap();
-  deviceStats["ram_usage_percent"] = used_ram * 100.0 / TOTAL_RAM;
-
-  // Flash usage percent
-  float flash_used = ESP.getSketchSize();
-  deviceStats["flash_usage_percent"] = flash_used * 100.0 / TOTAL_FLASH;
-
-  // Signal Quality
-  deviceStats["signal_quality"] = WiFi.RSSI();
-  ;
-
-  // SD Card status and storage
-  deviceStats["sd_card"] = sdCardAvailable ? "Available" : "Not available";
-  if (sdCardAvailable)
-  {
-    deviceStats["pending_records"] = pendingRecords;
-  }
-}
 
 // Function to publish status updates
 void publishUpdateStatus(const char *status, const char *message)
@@ -391,14 +364,37 @@ void publishWeatherData()
 // Function to generate status report
 void publishStatusReport()
 {
-  StaticJsonDocument<200> doc;
+  const float TOTAL_RAM = 327680.0;
+  const float TOTAL_FLASH = 1310720.0;
+
+  // RAM usage percent (used = total - free heap)
+  float used_ram = TOTAL_RAM - ESP.getFreeHeap();
+  float RAM_USAGE = used_ram * 100.0 / TOTAL_RAM;
+
+  // Flash usage percent
+  float flash_used = ESP.getSketchSize();
+  float FLASH_USAGE = flash_used * 100.0 / TOTAL_FLASH;
+
+  // Signal Quality
+  int WIFI_RSSI = WiFi.RSSI();
+  
+  // SD Card status and storage
+  const char* SD_CARD = sdCardAvailable ? "Available" : "Not available";
+  int PENDING_RECORDS;
+  if (sdCardAvailable)
+  {
+    PENDING_RECORDS = pendingRecords;
+  }
+
+  StaticJsonDocument<256> doc;
   doc["device_id"] = DEVICE_ID;
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["activated"] = deviceActivated;
-
-  // Add memory statistics
-  JsonObject deviceStats = doc.createNestedObject("memory");
-  getDeviceStats(deviceStats);
+  doc["ram_usage"] = RAM_USAGE;
+  doc["flash_usage"] = FLASH_USAGE;
+  doc["wifi_quality"] = WIFI_RSSI;
+  doc["sd_card"] = SD_CARD;
+  doc["pending_records"] = PENDING_RECORDS;
 
   String jsonStr;
   serializeJson(doc, jsonStr);

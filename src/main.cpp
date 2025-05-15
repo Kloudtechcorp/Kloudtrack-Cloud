@@ -84,7 +84,6 @@ unsigned long lastSyncAttempt = 0;
 int pendingRecords = 0;
 
 // Functions
-void getDeviceStats(JsonObject &deviceStats);
 void publishUpdateStatus(const char *status, const char *message);
 bool isDeviceActivated();
 void activateDevice(bool activate);

@@ -1,9 +1,7 @@
 /*
-  Version 2.3.1
-  Data Logging for Kloudtrack - GSM
-  - data will be stored to SD Card if no internet is available
-  - upon reconnection, data will be sent to IoT Core
-  - Data will be deleted upon being transferred
+  Version 2.3.2
+  FreeRTOS for Kloudtrack - GSM
+  - ESP32 would run different tasks on different cores
 */ 
 #include <Arduino.h>
 #include <PubSubClient.h>
@@ -15,6 +13,11 @@
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/event_groups.h"
 
 // MQTT Topics
 char AWS_IOT_DEVICE_COMMAND_TOPIC[50];
@@ -30,6 +33,44 @@ char AWS_IOT_DEVICE_STATUS_TOPIC[50];
 // Weather data parameters
 #define WEATHER_PUBLISH_INTERVAL 60000
 unsigned long lastWeatherPublish = 0;
+
+// Define task priorities (higher number = higher priority)
+#define GSM_TASK_PRIORITY       3
+#define MQTT_TASK_PRIORITY      2
+#define WEATHER_TASK_PRIORITY   1
+#define SD_SYNC_TASK_PRIORITY   1
+#define OTA_TASK_PRIORITY       4  // High priority for OTA updates
+
+// Define task stack sizes (in words)
+#define GSM_TASK_STACK_SIZE     4096
+#define MQTT_TASK_STACK_SIZE    4096
+#define WEATHER_TASK_STACK_SIZE 4096
+#define SD_SYNC_TASK_STACK_SIZE 4096
+#define OTA_TASK_STACK_SIZE     8192  // Larger stack for OTA updates
+
+// Task handles
+TaskHandle_t gsmTaskHandle = NULL;
+TaskHandle_t mqttTaskHandle = NULL;
+TaskHandle_t weatherTaskHandle = NULL;
+TaskHandle_t sdSyncTaskHandle = NULL;
+TaskHandle_t otaTaskHandle = NULL;
+
+// Event group for system state flags
+EventGroupHandle_t systemStateEventGroup = NULL;
+
+// Define event bits
+#define GSM_CONNECTED_BIT       (1 << 0)
+#define MQTT_CONNECTED_BIT      (1 << 1)
+#define SD_CARD_READY_BIT       (1 << 2)
+#define DEVICE_ACTIVATED_BIT    (1 << 3)
+#define OTA_IN_PROGRESS_BIT     (1 << 4)
+
+// Mutex for protecting shared resources
+SemaphoreHandle_t sdCardMutex = NULL;
+SemaphoreHandle_t modemMutex = NULL;
+
+// Queue for weather data
+QueueHandle_t weatherDataQueue = NULL;
 
 // Weather data ranges
 #define MIN_TEMPERATURE 15.0
@@ -83,26 +124,12 @@ const unsigned long maxReconnectDelay = 60000;
 unsigned long lastSyncAttempt = 0;
 int pendingRecords = 0;
 
-// Functions
-void publishUpdateStatus(const char *status, const char *message);
-bool isDeviceActivated();
-void activateDevice(bool activate);
-void parseURL(const String &url, String &host, int &port, String &path);
-bool testServerConnection(const String &host, int port);
-bool performOTAUpdate(const char *url, const char *expectedChecksum);
-void handleUpdateCommand(const JsonDocument &doc);
-void publishWeatherData();
-void publishStatusReport();
-void messageHandler(char *topic, byte *payload, unsigned int length);
-void connectWiFi();
-void connectToAWS();
-bool setupSDCard();
-bool saveWeatherDataToSD(const char *jsonData);
-bool syncOfflineData();
-String generateWeatherDataJson();
-void checkAndSyncData();
-String getNextDataFilename();
-bool deleteDataFile(const String &filename);
+// Task function declarations
+void gsmTask(void *pvParameters);
+void mqttTask(void *pvParameters);
+void weatherTask(void *pvParameters);
+void sdSyncTask(void *pvParameters);
+void otaTask(void *pvParameters);
 
 // Function to publish status updates
 void publishUpdateStatus(const char *status, const char *message)
@@ -114,7 +141,7 @@ void publishUpdateStatus(const char *status, const char *message)
   Serial.printf("Published status: %s - %s\n", status, message);
 }
 
-// Function to check if device is activated
+// Function to check if device is activated - now thread-safe
 bool isDeviceActivated()
 {
   preferences.begin("kloudtrack", false);
@@ -123,13 +150,20 @@ bool isDeviceActivated()
   return activated;
 }
 
-// Function to activate the device
+// Function to activate the device - now thread-safe
 void activateDevice(bool activate)
 {
   preferences.begin("kloudtrack", false);
   preferences.putBool("activated", activate);
   preferences.end();
   deviceActivated = activate;
+
+  // Update the event group bit
+  if (activate) {
+    xEventGroupSetBits(systemStateEventGroup, DEVICE_ACTIVATED_BIT);
+  } else {
+    xEventGroupClearBits(systemStateEventGroup, DEVICE_ACTIVATED_BIT);
+  }
 
   // Publish activation status
   StaticJsonDocument<200> doc;
@@ -140,8 +174,10 @@ void activateDevice(bool activate)
   String jsonStr;
   serializeJson(doc, jsonStr);
 
-  // Publish to device-specific activation topic
-  mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonStr.c_str());
+  // Publish to device-specific activation topic if MQTT is connected
+  if (mqttClient.connected()) {
+    mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonStr.c_str());
+  }
 
   Serial.printf("Device %s\n", activate ? "ACTIVATED" : "DEACTIVATED");
 }
@@ -226,7 +262,7 @@ bool testServerConnection(const String &host, int port) {
   return false;
 }
 
-// Function to perform OTA update using GSM
+// Updated OTA update function to work with FreeRTOS
 bool performOTAUpdate(const String &url) {
   String host, path;
   int port;
@@ -252,7 +288,7 @@ bool performOTAUpdate(const String &url) {
 
   // Reset the SSL client before creating HTTP client to ensure fresh connection
   sslClient.stop();
-  delay(1000);
+  vTaskDelay(pdMS_TO_TICKS(1000));
   
   // Set the certificates for the OTA server specifically
   sslClient.setCACert(AWS_CERT_CA);
@@ -273,7 +309,7 @@ bool performOTAUpdate(const String &url) {
     if (err == 0) break;
     
     Serial.printf("[OTA] HTTP GET failed (attempt %d/%d): %d\n", retry+1, maxRetries, err);
-    delay(1000 * (retry + 1)); // Exponential backoff
+    vTaskDelay(pdMS_TO_TICKS(1000 * (retry + 1))); // Exponential backoff
   }
   
   if (err != 0) {
@@ -314,9 +350,9 @@ bool performOTAUpdate(const String &url) {
   Serial.println("[OTA] Starting update...");
   publishUpdateStatus("OTA", "Writing firmware to flash");
 
-  // Significantly increase buffer size (use 4KB or 8KB if memory allows)
-  const size_t bufferSize = 4096;  // 4KB buffer instead of 512 bytes
-  uint8_t *buff = (uint8_t*)malloc(bufferSize);
+  // Significantly increase buffer size (use 4KB buffer)
+  const size_t bufferSize = 4096;  // 4KB buffer
+  uint8_t *buff = (uint8_t*)heap_caps_malloc(bufferSize, MALLOC_CAP_8BIT);
 
   if (!buff) {
     Serial.println("[OTA] Failed to allocate buffer memory");
@@ -338,12 +374,13 @@ bool performOTAUpdate(const String &url) {
     if (millis() - lastRead > readTimeout) {
       Serial.println("[OTA] Read timeout");
       publishUpdateStatus("Error", "Download timeout");
-      free(buff);
+      heap_caps_free(buff);
       Update.abort();
       return false;
     }
 
-    esp_task_wdt_reset(); // Reset watchdog during long download
+    // Reset task watchdog to prevent timeouts during long download
+    vTaskDelay(1);
     
     int available = http.available();
     if (available > 0) {
@@ -357,7 +394,7 @@ bool performOTAUpdate(const String &url) {
         // Write to Update
         if (Update.write(buff, readBytes) != readBytes) {
           Serial.printf("[OTA] Write failed: %s\n", Update.errorString());
-          free(buff);
+          heap_caps_free(buff);
           Update.abort();
           return false;
         }
@@ -370,17 +407,14 @@ bool performOTAUpdate(const String &url) {
           lastProgress = progress;
           Serial.printf("[OTA] Progress: %d%%\n", progress);
         }
-        
-        // Small delay to allow background tasks (WiFi/GSM stack, etc.)
-        delay(1);
       }
     } else if (available == 0) {
       // No data available, give the GSM modem time to process
-      delay(10);
+      vTaskDelay(pdMS_TO_TICKS(10));
     }
   }
   
-  free(buff); // Free the buffer
+  heap_caps_free(buff); // Free the buffer
   
   uint32_t updateTime = (millis() - startTime) / 1000;
   Serial.printf("[OTA] Download completed in %d seconds\n", updateTime);
@@ -410,7 +444,7 @@ bool performOTAUpdate(const String &url) {
   publishUpdateStatus("Success", "Update complete, rebooting device");
   
   // Add a delay to ensure the final status message is sent
-  delay(1000);
+  vTaskDelay(pdMS_TO_TICKS(1000));
   
   // Restart ESP32 to apply the new firmware
   ESP.restart();
@@ -444,7 +478,6 @@ void handleUpdateCommand(const JsonDocument& doc) {
   publishUpdateStatus("Starting", "Beginning OTA update...");
   performOTAUpdate(url.c_str());
 }
-
 
 // Generate weather data JSON string
 String generateWeatherDataJson()
@@ -481,38 +514,6 @@ String generateWeatherDataJson()
   String jsonString;
   serializeJson(doc, jsonString);
   return jsonString;
-}
-
-// Function to generate and publish weather data
-void publishWeatherData()
-{
-  String jsonString = generateWeatherDataJson();
-
-  if (modem.isNetworkConnected() && mqttClient.connected())
-  {
-    // Publish to device-specific weather topic
-    mqttClient.publish(AWS_IOT_DEVICE_WEATHER_TOPIC, jsonString.c_str());
-  }
-  else
-  {
-    // Save to SD card if WiFi or MQTT is not available
-    if (sdCardAvailable)
-    {
-      if (saveWeatherDataToSD(jsonString.c_str()))
-      {
-        Serial.println("Weather data saved to SD card (offline mode)");
-        pendingRecords++;
-      }
-      else
-      {
-        Serial.println("Failed to save weather data to SD card");
-      }
-    }
-    else
-    {
-      Serial.println("No connectivity and SD card not available - data lost");
-    }
-  }
 }
 
 // Function to generate status report
@@ -557,7 +558,6 @@ void publishStatusReport()
   mqttClient.publish(AWS_IOT_DEVICE_STATUS_TOPIC, jsonStr.c_str());
 }
 
-// MQTT message handler
 void messageHandler(char *topic, byte *payload, unsigned int length)
 {
   Serial.print("Message received on topic: ");
@@ -591,191 +591,88 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
       Serial.println("Status command received.");
       publishStatusReport();
     }
-    else if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0)
-    {
-      // Handle device reset
-      if (doc.containsKey("reset") && doc["reset"].as<bool>())
-      {
-        // Publish notification that device is restarting
-        publishUpdateStatus("Resetting", "Device restarting per command request");
-
-        Serial.println("Reset command received. Restarting device...");
-
-        // Give time for the MQTT message to be sent
-        delay(1000);
-
-        // Restart the ESP32
-        ESP.restart();
-      }
-      // Handle device activation
-      else if (doc.containsKey("activate"))
-      {
-        bool activateState = doc["activate"].as<bool>();
-
-        // Set activation state based on the boolean value
-        activateDevice(activateState);
-
-        if (activateState)
-        {
-          Serial.println("Device activated successfully");
-          publishUpdateStatus("Activated", "Device activated successfully");
-        }
-        else
-        {
-          Serial.println("Device deactivated");
-          publishUpdateStatus("Deactivated", "Device deactivated");
-        }
-      }
-      // Handle OTA update command
-      else if (doc.containsKey("update") && doc["update"].as<bool>() == true)
-      {
-        if (doc.containsKey("url"))
-        {
-          // Optional: allow version and force update flags
-          handleUpdateCommand(doc);
-        }
-        else
-        {
-          publishUpdateStatus("Error", "Missing url for update");
-        }
-      }
-      // Handle force sync command
-      else if (doc.containsKey("sync") && doc["sync"].as<bool>() == true)
-      {
-        if (syncOfflineData())
-        {
-          publishUpdateStatus("Synced", "Offline data synchronized successfully");
-        }
-        else
-        {
-          publishUpdateStatus("Sync Failed", "Failed to synchronize offline data");
-        }
-      }
-    }
   } 
-  Serial.println("---------------------------------");
-}
-
-// Function to initialize GSM modem
-void initGSM() {
-  SerialMon.println("Initializing GSM modem...");
-  // A7670-GSM Reset
-  pinMode(RESET, OUTPUT);
-  digitalWrite(RESET, LOW); delay(100);
-  digitalWrite(RESET, HIGH); delay(100);
-  digitalWrite(RESET, LOW); delay(100);
-
-  // A7670-GSM Power
-  pinMode(PWR_PIN, OUTPUT);
-  digitalWrite(PWR_PIN, LOW); delay(100);
-  digitalWrite(PWR_PIN, HIGH); delay(100);
-  digitalWrite(PWR_PIN, LOW); delay(1000);  // Increased delay
-
-  Serial.println("Starting Serial Communications...");
-  SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
-  
-  // Wait for the modem to initialize
-  delay(3000);
-
-  Serial.println("Connecting to cellular network...");
-  modem.gprsConnect(APN);
-  unsigned long gsmStart = millis();
-  while (!modem.isNetworkConnected() && (millis() - gsmStart < 10000))
+  else if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0)
   {
-    delay(1000);
-    Serial.print(".");
-  }
-  if (modem.isNetworkConnected())
-  {
-    Serial.println("\nGSM connected!");
-    gsmRetryCount = 0;
-  }
-  else
-  {
-    gsmRetryCount++;
-    Serial.printf("\nGSM connection failed. Attempt %d/%d\n", gsmRetryCount, maxRetries);
-
-    // Instead of restarting after maxRetries, collect and store data locally
-    if (gsmRetryCount >= maxRetries)
+    // Handle device reset
+    if (doc.containsKey("reset") && doc["reset"].as<bool>())
     {
-      Serial.println("Maximum GSM retries reached. Continuing in offline mode.");
+      // Publish notification that device is restarting
+      publishUpdateStatus("Resetting", "Device restarting per command request");
+      Serial.println("Reset command received. Restarting device...");
 
-      // Collect weather data before attempting further reconnections
-      if (deviceActivated && sdCardAvailable)
-      {
-        String weatherData = generateWeatherDataJson();
-        if (saveWeatherDataToSD(weatherData.c_str()))
-        {
-          Serial.println("Weather data saved to SD card while offline");
-          pendingRecords++;
-        }
-      }
+      // Give time for the MQTT message to be sent
+      vTaskDelay(pdMS_TO_TICKS(1000));
 
-      // Reset retry counter and implement longer delay
-      gsmRetryCount = 0;
-      delay(60000); // Wait a minute before trying again
+      // Restart the ESP32
+      ESP.restart();
     }
-  }
-  Serial.println("---------------------------------");
-}
-  
-// Function to connect to AWS IoT
-void connectToAWS()
-{
-  if (modem.isNetworkConnected())
-  {
-    SerialMon.println("Connecting to AWS IoT...");
-    mqttClient.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
-    mqttClient.setCallback(messageHandler);
-
-    if (!sslClient.connected()) {
-      // Only set certs if SSL connection is fresh
-      sslClient.setCACert(AWS_CERT_CA);
-      sslClient.setCertificate(AWS_CERT_CRT);
-      sslClient.setPrivateKey(AWS_CERT_PRIVATE);
-    }
-
-    if (!mqttClient.connected())
+    // Handle device activation
+    else if (doc.containsKey("activate"))
     {
-      mqttRetryCount++;
-      Serial.printf("Connecting to AWS IoT. Attempt %d/%d\n", mqttRetryCount, maxRetries);
+      bool activateState = doc["activate"].as<bool>();
 
-      if (mqttClient.connect(DEVICE_ID))
+      // Set activation state based on the boolean value
+      activateDevice(activateState);
+
+      if (activateState)
       {
-        Serial.println("Connected!");
-        mqttRetryCount = 0;
-        reconnectDelay = 1000;
-
-        // Subscribe to all relevant topics
-        mqttClient.subscribe(AWS_IOT_DEVICE_COMMAND_TOPIC);
-        mqttClient.subscribe(AWS_IOT_DEVICE_WEATHER_TOPIC);
-        mqttClient.subscribe(AWS_IOT_DEVICE_STATUS_TOPIC);
-
-        // Check activation status
-        deviceActivated = isDeviceActivated();
-
-        // Publish a startup message
-        publishUpdateStatus(deviceActivated ? "Online" : "Inactive",
-                            deviceActivated ? "Ready for updates" : "Requires activation");
+        Serial.println("Device activated successfully");
+        publishUpdateStatus("Activated", "Device activated successfully");
+        xEventGroupSetBits(systemStateEventGroup, DEVICE_ACTIVATED_BIT);
       }
       else
       {
-        // Exponential backoff
-        // Serial.printf("Failed, rc=%d. Retrying in %d ms\n", mqttClient.state(), reconnectDelay);
-        reconnectDelay = min(reconnectDelay * 2, maxReconnectDelay);
-        delay(reconnectDelay);
+        Serial.println("Device deactivated");
+        publishUpdateStatus("Deactivated", "Device deactivated");
+        xEventGroupClearBits(systemStateEventGroup, DEVICE_ACTIVATED_BIT);
       }
     }
-    if (mqttRetryCount >= maxRetries)
+    // Handle OTA update command
+    else if (doc.containsKey("update") && doc["update"].as<bool>() == true)
     {
-      Serial.println("Maximum MQTT retries reached. Restarting ESP32.");
-      ESP.restart();
+      if (doc.containsKey("url"))
+      {
+        // Check if OTA is already in progress
+        EventBits_t bits = xEventGroupGetBits(systemStateEventGroup);
+        if ((bits & OTA_IN_PROGRESS_BIT) == OTA_IN_PROGRESS_BIT) {
+          publishUpdateStatus("Busy", "OTA update already in progress");
+          return;
+        }
+
+        // Start OTA process in a separate task
+        String url = doc["url"].as<String>();
+        String* urlCopy = new String(url);  // Create copy for task parameter
+        
+        // Check if the OTA task is already created
+        if (otaTaskHandle != NULL) {
+          // Resume the task with new parameters
+          vTaskResume(otaTaskHandle);
+        } else {
+          // Create a new OTA task
+          xTaskCreate(otaTask, "OTA_Task", OTA_TASK_STACK_SIZE, (void*)urlCopy, OTA_TASK_PRIORITY, &otaTaskHandle);
+        }
+        
+        publishUpdateStatus("Starting", "OTA update process initiated");
+      }
+      else
+      {
+        publishUpdateStatus("Error", "Missing url for update");
+      }
     }
-    Serial.println("---------------------------------");
+    // Handle force sync command
+    else if (doc.containsKey("sync") && doc["sync"].as<bool>() == true)
+    {
+      // Flag for immediate sync
+      lastSyncAttempt = 0;  // This will trigger sync in the SD task
+      publishUpdateStatus("Syncing", "Starting offline data synchronization");
+    }
   }
+  
+  Serial.println("---------------------------------");
 }
 
-// Initialize SD card
+// Modified setupSDCard function
 bool setupSDCard()
 {
   Serial.println("Initializing SD card...");
@@ -834,9 +731,26 @@ String getNextDataFilename()
   return String(filename);
 }
 
-// Save weather data to SD card
+// Delete a data file after successful sync
+bool deleteDataFile(const String &filename)
+{
+  if (SD.remove(filename))
+  {
+    Serial.printf("Deleted file: %s\n", filename.c_str());
+    return true;
+  }
+  else
+  {
+    Serial.printf("Failed to delete file: %s\n", filename.c_str());
+    return false;
+  }
+}
+
+// Modified saveWeatherDataToSD function to be called with mutex protection
 bool saveWeatherDataToSD(const char *jsonData)
 {
+  // Note: This function assumes the SD card mutex is already held by the caller
+  
   if (!sdCardAvailable)
   {
     return false;
@@ -867,119 +781,437 @@ bool saveWeatherDataToSD(const char *jsonData)
   }
 }
 
-// Delete a data file after successful sync
-bool deleteDataFile(const String &filename)
+void gsmTask(void *pvParameters)
 {
-  if (SD.remove(filename))
-  {
-    Serial.printf("Deleted file: %s\n", filename.c_str());
-    return true;
+  // GSM connection retry parameters
+  int retryCount = 0;
+  const int maxRetries = 5;
+  TickType_t reconnectDelay = pdMS_TO_TICKS(1000);
+  const TickType_t maxReconnectDelay = pdMS_TO_TICKS(60000);
+
+  // Initalize GSM
+  if (xSemaphoreTake(modemMutex, portMAX_DELAY) == pdTRUE) {
+    // A7670-GSM Reset
+    pinMode(RESET, OUTPUT);
+    digitalWrite(RESET, LOW); delay(100);
+    digitalWrite(RESET, HIGH); delay(100);
+    digitalWrite(RESET, LOW); delay(100);
+
+    // A7670-GSM Power
+    pinMode(PWR_PIN, OUTPUT);
+    digitalWrite(PWR_PIN, LOW); delay(100);
+    digitalWrite(PWR_PIN, HIGH); delay(100);
+    digitalWrite(PWR_PIN, LOW); delay(1000);  // Increased delay
+
+    Serial.println("Starting Serial Communications...");
+    SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+
+    xSemaphoreGive(modemMutex);
   }
-  else
-  {
-    Serial.printf("Failed to delete file: %s\n", filename.c_str());
-    return false;
+
+  vTaskDelay(pdMS_TO_TICKS(3000));
+
+  // Main task loop
+  for (;;) {
+    // Check if GSM is connected
+    if (xSemaphoreTake(modemMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      bool isConnected = modem.isNetworkConnected();
+      xSemaphoreGive(modemMutex);
+
+      if (!isConnected) {
+        Serial.println("GSM not connected, attempting to connect...");
+
+        if (xSemaphoreTake(modemMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+          Serial.println("Connecting to GSM network...");
+          modem.gprsConnect(APN);
+
+          // Wait for connection with timeout
+          TickType_t startTime = xTaskGetTickCount();
+          bool connected = false;
+
+          while ((xTaskGetTickCount() - startTime) < pdMS_TO_TICKS(10000)) {
+            if (modem.isNetworkConnected()) {
+              connected = true;
+              break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            Serial.print(".");
+          }
+
+          if (connected) {
+            Serial.println("\nGSM connected!");
+            retryCount = 0;
+            reconnectDelay = pdMS_TO_TICKS(1000);
+
+            // Set the GSM connected bit
+            xEventGroupSetBits(systemStateEventGroup, GSM_CONNECTED_BIT);
+          } 
+          else {
+            retryCount++;
+            Serial.printf("\nGSM connection failed. Attempt %d/%d\n", retryCount, maxRetries);
+
+            // Clear the GSM connected bit
+            xEventGroupClearBits(systemStateEventGroup, GSM_CONNECTED_BIT);
+
+            if (retryCount >= maxRetries) {
+              Serial.println("Max retries reached. Waiting before next attempts.");
+              retryCount = 0;
+              reconnectDelay = maxReconnectDelay;
+            }
+            else {
+              // Exponential backoff
+              reconnectDelay = (reconnectDelay * 2 < maxReconnectDelay) ? reconnectDelay * 2 : maxReconnectDelay;
+            }
+          }
+
+          xSemaphoreGive(modemMutex);
+        }
+
+        // Wait before next attempt if needed
+        vTaskDelay(reconnectDelay);
+      }
+      else {
+        // Modem is connected, maintain periodic check
+        vTaskDelay(pdMS_TO_TICKS(30000)); // Check every 10 seconds
+      }
+    }
+    else {
+      // Could not acquire mutex, try again shortly
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
   }
 }
 
-// Sync offline data with cloud
-bool syncOfflineData()
-{
-  if (!sdCardAvailable)
-  {
-    Serial.println("SD card not available for syncing");
-    return false;
+void mqttTask(void *pvParameters) {
+  int retryCount = 0;
+  const int maxRetries = 5;
+  TickType_t reconnectDelay = pdMS_TO_TICKS(1000);
+  const TickType_t maxReconnectDelay = pdMS_TO_TICKS(60000);
+
+  // Setup MQTT client
+  mqttClient.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
+  mqttClient.setCallback(messageHandler);
+  
+  // Wait for GSM to be ready before attempting MQTT connection
+  for (;;) {
+    EventBits_t bits = xEventGroupWaitBits(
+      systemStateEventGroup,
+      GSM_CONNECTED_BIT,
+      pdFALSE,   // Don't clear bit
+      pdTRUE,    // Wait for all bits
+      pdMS_TO_TICKS(10000)
+    );
+    
+    if ((bits & GSM_CONNECTED_BIT) == GSM_CONNECTED_BIT) {
+      Serial.println("GSM ready, attempting MQTT connection");
+      break;
+    } else {
+      Serial.println("Waiting for GSM connection...");
+      vTaskDelay(pdMS_TO_TICKS(5000));
+    }
   }
-
-  if (!modem.isNetworkConnected() || !mqttClient.connected())
-  {
-    Serial.println("Network connection not available for syncing");
-    return false;
-  }
-
-  Serial.println("Starting data synchronization...");
-
-  int syncedCount = 0;
-  File root = SD.open(SD_DATA_DIR);
-  if (!root)
-  {
-    Serial.println("Failed to open data directory");
-    return false;
-  }
-
-  if (!root.isDirectory())
-  {
-    Serial.println("Data path is not a directory");
-    root.close();
-    return false;
-  }
-
-  // Process up to 10 files at a time to avoid blocking the main loop for too long
-  int processLimit = 10;
-  File file = root.openNextFile();
-  while (file && processLimit > 0)
-  {
-    processLimit--;
-
-    if (!file.isDirectory())
-    {
-      // Read the file content
-      String path = String(SD_DATA_DIR) + "/" + String(file.name());
-      String data = "";
-      while (file.available())
-      {
-        data += (char)file.read();
+  
+  // Main task loop
+  for (;;) {
+    // Check if we're connected to MQTT
+    if (!mqttClient.connected()) {
+      // Clear the MQTT connected bit
+      xEventGroupClearBits(systemStateEventGroup, MQTT_CONNECTED_BIT);
+      
+      if (xSemaphoreTake(modemMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        bool gsmConnected = modem.isNetworkConnected();
+        xSemaphoreGive(modemMutex);
+        
+        if (gsmConnected) {
+          Serial.printf("Connecting to AWS IoT. Attempt %d/%d\n", retryCount + 1, maxRetries);
+          
+          // Set SSL certificates
+          if (!sslClient.connected()) {
+            sslClient.setCACert(AWS_CERT_CA);
+            sslClient.setCertificate(AWS_CERT_CRT);
+            sslClient.setPrivateKey(AWS_CERT_PRIVATE);
+          }
+          
+          if (mqttClient.connect(DEVICE_ID)) {
+            Serial.println("Connected to AWS IoT!");
+            retryCount = 0;
+            reconnectDelay = pdMS_TO_TICKS(1000);
+            
+            // Subscribe to topics
+            mqttClient.subscribe(AWS_IOT_DEVICE_COMMAND_TOPIC);
+            mqttClient.subscribe(AWS_IOT_DEVICE_WEATHER_TOPIC);
+            mqttClient.subscribe(AWS_IOT_DEVICE_STATUS_TOPIC);
+            
+            // Set the MQTT connected bit
+            xEventGroupSetBits(systemStateEventGroup, MQTT_CONNECTED_BIT);
+            
+            // Publish a startup message
+            publishUpdateStatus(deviceActivated ? "Online" : "Inactive",
+                                deviceActivated ? "Ready for updates" : "Requires activation");
+          } else {
+            retryCount++;
+            Serial.printf("Failed to connect to MQTT, rc=%d\n", mqttClient.state());
+            
+            if (retryCount >= maxRetries) {
+              Serial.println("Maximum MQTT retries reached. Will try again later.");
+              retryCount = 0;
+              // Wait longer before retrying
+              vTaskDelay(pdMS_TO_TICKS(60000));
+            } else {
+              // Exponential backoff
+              reconnectDelay = (reconnectDelay * 2 < maxReconnectDelay) ? reconnectDelay * 2 : maxReconnectDelay;
+              vTaskDelay(reconnectDelay);
+            }
+          }
+        } else {
+          Serial.println("GSM not connected. Cannot establish MQTT connection.");
+          vTaskDelay(pdMS_TO_TICKS(5000));
+        }
+      } else {
+        // Could not acquire mutex
+        vTaskDelay(pdMS_TO_TICKS(1000));
       }
-      file.close();
-
-      // Publish the data
-      if (mqttClient.publish(AWS_IOT_DEVICE_WEATHER_TOPIC, data.c_str()))
-      {
-        // Delete the file after successful publish
-        if (deleteDataFile(path))
-        {
-          syncedCount++;
-          pendingRecords--;
+    } else {
+      // MQTT is connected, process messages
+      mqttClient.loop();
+      
+      // Check for messages in weather data queue and publish if connected
+      String* weatherJson = NULL;
+      if (xQueueReceive(weatherDataQueue, &weatherJson, 0) == pdTRUE) {
+        if (weatherJson != NULL) {
+          bool published = mqttClient.publish(AWS_IOT_DEVICE_WEATHER_TOPIC, weatherJson->c_str());
+          if (published) {
+            Serial.println("Weather data published to MQTT");
+          } else {
+            Serial.println("Failed to publish weather data");
+            // Put the message back in the queue for retry
+            if (xQueueSendToFront(weatherDataQueue, &weatherJson, 0) != pdTRUE) {
+              delete weatherJson;  // If queue is full, delete to prevent memory leak
+            }
+          }
         }
       }
-      else
-      {
-        Serial.printf("Failed to publish data from file: %s\n", path.c_str());
-      }
+      
+      // Short delay before next loop iteration
+      vTaskDelay(pdMS_TO_TICKS(100));
     }
-    else
-    {
-      file.close();
-    }
-
-    // Get next file
-    file = root.openNextFile();
   }
-
-  root.close();
-  Serial.printf("Synchronized %d files\n", syncedCount);
-
-  return syncedCount > 0;
 }
 
-// Check connectivity and sync data when available
-void checkAndSyncData()
+void weatherTask(void *pvParameters)
 {
-  if (modem.isNetworkConnected() && mqttClient.connected() && pendingRecords > 0)
-  {
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastSyncAttempt >= SYNC_INTERVAL)
-    {
-      lastSyncAttempt = currentMillis;
-      Serial.println("Auto-syncing offline data...");
-      syncOfflineData();
+  TickType_t lastWeatherPublishTime = 0;
+  const TickType_t weatherPublishInterval = pdMS_TO_TICKS(WEATHER_PUBLISH_INTERVAL);
+  
+  // Wait a bit before starting to allow other systems to initialize
+  vTaskDelay(pdMS_TO_TICKS(5000));
+  
+  // Main task loop
+  for (;;) {
+    // Check if it's time to publish weather data
+    TickType_t currentTime = xTaskGetTickCount();
+    
+    if ((currentTime - lastWeatherPublishTime) >= weatherPublishInterval) {
+      lastWeatherPublishTime = currentTime;
+      
+      // Check if device is activated before collecting data
+      EventBits_t bits = xEventGroupGetBits(systemStateEventGroup);
+      if ((bits & DEVICE_ACTIVATED_BIT) == DEVICE_ACTIVATED_BIT) {
+        // Generate the weather data JSON
+        String* weatherJsonStr = new String(generateWeatherDataJson());
+        
+        if (weatherJsonStr != NULL && weatherJsonStr->length() > 0) {
+          Serial.println("Weather data generated: " + *weatherJsonStr);
+          
+          // Check if we have MQTT connection
+          bits = xEventGroupGetBits(systemStateEventGroup);
+          bool mqttConnected = ((bits & MQTT_CONNECTED_BIT) == MQTT_CONNECTED_BIT);
+          
+          if (mqttConnected) {
+            // Send to queue for MQTT publishing
+            if (xQueueSend(weatherDataQueue, &weatherJsonStr, pdMS_TO_TICKS(1000)) != pdTRUE) {
+              Serial.println("Failed to add weather data to queue - queue full");
+              
+              // If can't queue, try to save to SD card
+              if ((bits & SD_CARD_READY_BIT) == SD_CARD_READY_BIT) {
+                if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                  if (saveWeatherDataToSD(weatherJsonStr->c_str())) {
+                    Serial.println("Weather data saved to SD card (queue full)");
+                    pendingRecords++;
+                  }
+                  xSemaphoreGive(sdCardMutex);
+                }
+              }
+              delete weatherJsonStr;  // Clean up if not queued or saved
+            }
+          } else {
+            // No MQTT connection, save to SD if available
+            if ((bits & SD_CARD_READY_BIT) == SD_CARD_READY_BIT) {
+              if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                if (saveWeatherDataToSD(weatherJsonStr->c_str())) {
+                  Serial.println("Weather data saved to SD card (offline mode)");
+                  pendingRecords++;
+                }
+                xSemaphoreGive(sdCardMutex);
+              }
+              delete weatherJsonStr;  // Clean up after saving
+            } else {
+              Serial.println("No connectivity and SD card not available - data lost");
+              delete weatherJsonStr;  // Clean up if not saved
+            }
+          }
+        }
+      }
+    }
+    
+    // Delay before next check
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+void sdSyncTask(void *pvParameters)
+{
+  TickType_t lastSyncAttempt = 0;
+  const TickType_t syncInterval = pdMS_TO_TICKS(SYNC_INTERVAL);
+  
+  // Wait for system to stabilize before starting
+  vTaskDelay(pdMS_TO_TICKS(10000));
+  
+  // Main task loop
+  for (;;) {
+    EventBits_t bits = xEventGroupGetBits(systemStateEventGroup);
+    bool sdCardReady = ((bits & SD_CARD_READY_BIT) == SD_CARD_READY_BIT);
+    bool mqttConnected = ((bits & MQTT_CONNECTED_BIT) == MQTT_CONNECTED_BIT);
+    
+    // Check if it's time to attempt sync
+    TickType_t currentTime = xTaskGetTickCount();
+    
+    if (sdCardReady && mqttConnected && pendingRecords > 0 && 
+        ((currentTime - lastSyncAttempt) >= syncInterval || lastSyncAttempt == 0)) {
+        
+      lastSyncAttempt = currentTime;
+      Serial.println("Starting offline data synchronization...");
+      
+      if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        int syncedCount = 0;
+        File root = SD.open(SD_DATA_DIR);
+        
+        if (root && root.isDirectory()) {
+          // Process up to 5 files at a time to avoid blocking too long
+          int processLimit = 5;
+          File file = root.openNextFile();
+          
+          while (file && processLimit > 0) {
+            processLimit--;
+            
+            if (!file.isDirectory()) {
+              // Read the file content
+              String path = String(SD_DATA_DIR) + "/" + String(file.name());
+              String data = "";
+              
+              while (file.available()) {
+                data += (char)file.read();
+              }
+              file.close();
+              
+              // Release SD mutex during MQTT publish
+              xSemaphoreGive(sdCardMutex);
+              
+              // Publish the data if MQTT still connected
+              if (mqttClient.connected() && mqttClient.publish(AWS_IOT_DEVICE_WEATHER_TOPIC, data.c_str())) {
+                // Take mutex again to delete file
+                if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                  if (deleteDataFile(path)) {
+                    syncedCount++;
+                    pendingRecords--;
+                  }
+                } else {
+                  // If can't get mutex, try delete in next sync cycle
+                  break;
+                }
+              } else {
+                // If MQTT failed, take mutex back and exit loop
+                if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                  break;
+                }
+                Serial.println("MQTT disconnected during sync");
+                break;
+              }
+            } else {
+              file.close();
+            }
+            
+            // Get next file if we still have the mutex
+            if (xSemaphoreGetMutexHolder(sdCardMutex) == xTaskGetCurrentTaskHandle()) {
+              file = root.openNextFile();
+            } else {
+              break;
+            }
+          }
+          
+          root.close();
+        }
+        
+        // Make sure we release the mutex
+        if (xSemaphoreGetMutexHolder(sdCardMutex) == xTaskGetCurrentTaskHandle()) {
+          xSemaphoreGive(sdCardMutex);
+        }
+        
+        Serial.printf("Synchronized %d files, %d remaining\n", syncedCount, pendingRecords);
+        
+        // If there are still records to sync, we'll try again later
+        if (syncedCount > 0 && pendingRecords > 0) {
+          // Schedule next sync sooner if we're making progress
+          lastSyncAttempt = currentTime - (syncInterval / 2);
+        }
+      }
+    } else if (!sdCardReady || pendingRecords == 0) {
+      // Nothing to do, check again after a delay
+      vTaskDelay(pdMS_TO_TICKS(60000));  // Check every minute
+    } else {
+      // Either waiting for MQTT connection or waiting for sync interval
+      vTaskDelay(pdMS_TO_TICKS(5000));  // Check every 5 seconds
     }
   }
+}
+
+void otaTask(void *pvParameters)
+{
+  // This task is created in suspended state and resumed when an OTA update is required
+  String updateUrl = *((String*)pvParameters);
+  free(pvParameters);  // Free the URL memory that was passed
+
+  Serial.println("OTA task started");
+  
+  // Set the OTA in progress bit
+  xEventGroupSetBits(systemStateEventGroup, OTA_IN_PROGRESS_BIT);
+  
+  // Perform the OTA update
+  bool updateSuccess = false;
+  
+  if (xSemaphoreTake(modemMutex, portMAX_DELAY) == pdTRUE) {
+    // Ensure we have GSM connectivity
+    if (modem.isNetworkConnected()) {
+      updateSuccess = performOTAUpdate(updateUrl);
+    } else {
+      Serial.println("OTA failed - no network connection");
+      publishUpdateStatus("Error", "No network connection for OTA");
+    }
+    xSemaphoreGive(modemMutex);
+  }
+  
+  if (!updateSuccess) {
+    // Clear the OTA in progress bit
+    xEventGroupClearBits(systemStateEventGroup, OTA_IN_PROGRESS_BIT);
+    Serial.println("OTA update failed");
+  }
+  
+  // This task will delete itself when done
+  vTaskDelete(NULL);
 }
 
 void setup()
 {
-  esp_task_wdt_init(30, true); // 30s watchdog
   Serial.begin(115200);
   delay(1000);
 
@@ -998,66 +1230,42 @@ void setup()
   deviceActivated = isDeviceActivated();
   Serial.printf("Device activation status: %s\n", deviceActivated ? "ACTIVATED" : "NOT ACTIVATED");
 
-  // Initialize SD card
+  // Create mutexes
+  sdCardMutex = xSemaphoreCreateMutex();
+  modemMutex = xSemaphoreCreateMutex();
+  
+  // Create event group
+  systemStateEventGroup = xEventGroupCreate();
+  
+  // Create queue for weather data (holds up to 10 JSON strings)
+  weatherDataQueue = xQueueCreate(10, sizeof(String*));
+
+  // Initialize SD card - with mutex protection
   sdCardAvailable = setupSDCard();
   Serial.printf("SD Card status: %s\n", sdCardAvailable ? "AVAILABLE" : "NOT AVAILABLE");
+  
+  // Set initial event group bits based on current state
+  if (sdCardAvailable) {
+    xEventGroupSetBits(systemStateEventGroup, SD_CARD_READY_BIT);
+  }
+  
+  if (deviceActivated) {
+    xEventGroupSetBits(systemStateEventGroup, DEVICE_ACTIVATED_BIT);
+  }
 
-  // Connect to WiFi and AWS IoT
-  initGSM();
-  connectToAWS();
-  lastWeatherPublish = millis();
-  lastSyncAttempt = millis();
+  // Create tasks
+  xTaskCreate(gsmTask, "GSM_Task", GSM_TASK_STACK_SIZE, NULL, GSM_TASK_PRIORITY, &gsmTaskHandle);
+  xTaskCreate(mqttTask, "MQTT_Task", MQTT_TASK_STACK_SIZE, NULL, MQTT_TASK_PRIORITY, &mqttTaskHandle);
+  xTaskCreate(weatherTask, "Weather_Task", WEATHER_TASK_STACK_SIZE, NULL, WEATHER_TASK_PRIORITY, &weatherTaskHandle);
+  xTaskCreate(sdSyncTask, "SD_Sync_Task", SD_SYNC_TASK_STACK_SIZE, NULL, SD_SYNC_TASK_PRIORITY, &sdSyncTaskHandle);
+  
+  // OTA task is created but suspended until needed
+  xTaskCreate(otaTask, "OTA_Task", OTA_TASK_STACK_SIZE, NULL, OTA_TASK_PRIORITY, &otaTaskHandle);
+  vTaskSuspend(otaTaskHandle);
 }
 
 void loop()
 {
-  esp_task_wdt_reset();
-  unsigned long currentMillis = millis();
-
-  // Maintain GSM connection
-  if (!modem.isNetworkConnected()) 
-  {
-    Serial.println("Network disconnected. Reconnecting...");
-    initGSM();
-  }
-
-  // Maintain MQTT connection
-  if (!mqttClient.connected())
-  {
-    Serial.println("MQTT disconnected. Reconnecting...");
-    connectToAWS();
-  }
-
-  // Process MQTT messages
-  mqttClient.loop();
-
-  // Publish weather data at regular intervals regardless of connectivity
-  if (currentMillis - lastWeatherPublish >= WEATHER_PUBLISH_INTERVAL)
-  {
-    lastWeatherPublish = currentMillis;
-    if (deviceActivated)
-    {
-      // Always generate data
-      String weatherData = generateWeatherDataJson();
-
-      // Try to publish if connected
-      if (modem.isNetworkConnected() && mqttClient.connected())
-      {
-        publishWeatherData();
-        Serial.println("Weather data published to MQTT");
-      }
-      // Otherwise save locally if SD card is available
-      else if (sdCardAvailable)
-      {
-        if (saveWeatherDataToSD(weatherData.c_str()))
-        {
-          Serial.println("Weather data saved to SD card (offline mode)");
-          pendingRecords++;
-        }
-      }
-    }
-  }
-
-  // Check and synchronize offline data if we're back online
-  checkAndSyncData();
+  // Just delay to prevent watchdog issues
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
 }

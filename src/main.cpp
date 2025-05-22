@@ -1,6 +1,6 @@
 /*
   Version 2.3.2
-  Included correct date and time for Kloudtrack - GSM
+  Correct date and time for Kloudtrack - GSM
   - Time is fetched using AT Commands
 */ 
 #include <Arduino.h>
@@ -22,7 +22,7 @@ char AWS_IOT_DEVICE_WEATHER_TOPIC[50];
 #define DEVICE_ID "KT-DEVICE-12345"
 
 // Current firmware version
-#define FIRMWARE_VERSION "2.3.1"
+#define FIRMWARE_VERSION "2.3.2"
 
 // Weather data parameters
 #define WEATHER_PUBLISH_INTERVAL 60000

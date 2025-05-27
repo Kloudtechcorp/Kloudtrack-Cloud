@@ -1,9 +1,7 @@
 /*
-  Version 2.3.1
-  Data Logging for Kloudtrack - WiFi
-  - data will be stored to SD Card if no internet is available
-  - upon reconnection, data will be sent to IoT Core
-  - Data will be deleted upon being transferred
+  Version 2.3.3
+  Correct time and date for Kloudtrack - WiFi
+  - Time is fetched using NTP  
 */ 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -22,13 +20,12 @@
 // MQTT Topics
 char AWS_IOT_DEVICE_COMMAND_TOPIC[50];
 char AWS_IOT_DEVICE_WEATHER_TOPIC[50];
-char AWS_IOT_DEVICE_STATUS_TOPIC[50];
 
 // Device ID
 #define DEVICE_ID "KT-DEVICE-12345"
 
 // Current firmware version
-#define FIRMWARE_VERSION "1.3.0"
+#define FIRMWARE_VERSION "2.3.3"
 
 // Weather data parameters
 #define WEATHER_PUBLISH_INTERVAL 60000
@@ -67,12 +64,21 @@ const unsigned long maxReconnectDelay = 60000;
 unsigned long lastSyncAttempt = 0;
 int pendingRecords = 0;
 
+// Time
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "asia.pool.ntp.org", 28800, 60000);
+char d[32];
+String dateTime;
+byte last_second, second_, minute_, hour_, day_, month_;
+int year_;
+
 // Functions
 void publishUpdateStatus(const char *status, const char *message);
 bool isDeviceActivated();
 void activateDevice(bool activate);
 bool performOTAUpdate(const char *url, const char *expectedChecksum);
 void handleUpdateCommand(const JsonDocument &doc);
+void getTime();
 void publishWeatherData();
 void publishStatusReport();
 void messageHandler(char *topic, byte *payload, unsigned int length);
@@ -292,6 +298,29 @@ void handleUpdateCommand(const JsonDocument &doc)
   }
 }
 
+// Function to get the time
+void getTime() {
+  timeClient.update();
+  unsigned long unix_epoch = timeClient.getEpochTime();
+
+  // Convert Unix epoch time to readable format
+  struct tm *timeinfo;
+  time_t rawtime = unix_epoch;
+  timeinfo = localtime(&rawtime);
+
+  if (timeinfo->tm_year >= 70) {
+    second_ = timeinfo->tm_sec;
+    minute_ = timeinfo->tm_min;
+    hour_ = timeinfo->tm_hour;
+    day_ = timeinfo->tm_mday;
+    month_ = timeinfo->tm_mon + 1;
+    year_ = timeinfo->tm_year + 1900;
+
+    sprintf(d, "%04d-%02d-%02d %02d:%02d:%02d", year_, month_, day_, hour_, minute_, second_);
+    dateTime = String(d);
+  }
+}
+
 // Generate weather data JSON string
 String generateWeatherDataJson()
 {
@@ -309,10 +338,13 @@ String generateWeatherDataJson()
   const char *weatherConditions[] = {"Sunny", "Partly Cloudy", "Cloudy", "Rainy", "Thunderstorm", "Foggy", "Snowy"};
   const char *weatherCondition = weatherConditions[random(0, 7)];
 
+  // Get time
+  getTime();
+
   // Create JSON document
   StaticJsonDocument<256> doc;
   doc["device_id"] = DEVICE_ID;
-  doc["timestamp"] = millis();
+  doc["recorded_at"] = dateTime;
 
   // Weather data
   JsonObject weather = doc.createNestedObject("weather");
@@ -386,6 +418,8 @@ void publishStatusReport()
     PENDING_RECORDS = pendingRecords;
   }
 
+  getTime();
+
   StaticJsonDocument<256> doc;
   doc["device_id"] = DEVICE_ID;
   doc["firmware_version"] = FIRMWARE_VERSION;
@@ -395,6 +429,7 @@ void publishStatusReport()
   doc["wifi_quality"] = WIFI_RSSI;
   doc["sd_card"] = SD_CARD;
   doc["pending_records"] = PENDING_RECORDS;
+  doc["date_time"] = dateTime;
 
   String jsonStr;
   serializeJson(doc, jsonStr);
@@ -428,16 +463,7 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
   }
 
   // Handle based on topic
-  if (strcmp(topic, AWS_IOT_DEVICE_STATUS_TOPIC) == 0)
-  {
-    // Check for status request
-    if (doc.containsKey("status") && doc["status"].as<bool>())
-    {
-      // Respond with current status when requested
-      publishStatusReport();
-    }
-  }
-  else if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0)
+  if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0)
   {
     // Handle device reset
     if (doc.containsKey("reset") && doc["reset"].as<bool>())
@@ -452,6 +478,13 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
 
       // Restart the ESP32
       ESP.restart();
+    }
+    // Handle status information
+    else if (doc.containsKey("status") && doc["status"].as<bool>())
+    {
+      // Respond with current status when requested
+      Serial.println("Status command received.");
+      publishStatusReport();
     }
     // Handle device activation
     else if (doc.containsKey("activate"))
@@ -546,6 +579,8 @@ void connectWiFi()
       }
     }
   }
+  getTime();
+  Serial.println("Date and Time: " + dateTime);
   Serial.println("---------------------------------");
 }
 
@@ -579,7 +614,6 @@ void connectToAWS()
         reconnectDelay = 1000;
 
         // Subscribe to all relevant topics
-        mqttClient.subscribe(AWS_IOT_DEVICE_STATUS_TOPIC);
         mqttClient.subscribe(AWS_IOT_DEVICE_COMMAND_TOPIC);
         mqttClient.subscribe(AWS_IOT_DEVICE_WEATHER_TOPIC);
 
@@ -600,7 +634,7 @@ void connectToAWS()
     }
     if (mqttRetryCount >= maxRetries)
     {
-      Serial.println("Maximum MQTT retries reached. Restarting ESP32.");
+      Serial.println("Maximum MQTT retries reached. Restarting ESP32.\n");
       ESP.restart();
     }
     Serial.println("---------------------------------");
@@ -811,16 +845,15 @@ void checkAndSyncData()
 
 void setup()
 {
-  esp_task_wdt_init(30, true); // 30s watchdog
+  esp_task_wdt_init(60, true); // 30s watchdog
   Serial.begin(115200);
   delay(1000);
 
   // Configure device-specific topics
   snprintf(AWS_IOT_DEVICE_COMMAND_TOPIC, 50, "kloudtrack/%s/command", DEVICE_ID);
   snprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, 50, "kloudtrack/%s/data", DEVICE_ID);
-  snprintf(AWS_IOT_DEVICE_STATUS_TOPIC, 50, "kloudtrack/%s/status", DEVICE_ID);
 
-  Serial.println("\n\n---------------------------------");
+  Serial.println("\n---------------------------------");
   Serial.println("ESP32 Weather Station");
   Serial.printf("Device ID: %s\n", DEVICE_ID);
   Serial.printf("Current Firmware Version: %s\n", FIRMWARE_VERSION);

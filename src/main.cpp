@@ -1,7 +1,8 @@
 /*
-  Version 2.3.2
-  Correct date and time for Kloudtrack - GSM
-  - Time is fetched using AT Commands
+  Version 2.3.3
+  Sensor Integration for Kloudtrack - GSM
+  - Collected real data instead of random ones
+  - Fixed bug with wind direction calculation
 */ 
 #include <Arduino.h>
 #include <PubSubClient.h>
@@ -13,6 +14,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
+#include "SensorManager.h"
 
 // MQTT Topics
 char AWS_IOT_DEVICE_COMMAND_TOPIC[50];
@@ -22,21 +24,12 @@ char AWS_IOT_DEVICE_WEATHER_TOPIC[50];
 #define DEVICE_ID "KT-DEVICE-12345"
 
 // Current firmware version
-#define FIRMWARE_VERSION "2.3.2"
+#define FIRMWARE_VERSION "2.3.3"
 
 // Weather data parameters
+SensorManager sensorManager;
 #define WEATHER_PUBLISH_INTERVAL 60000
 unsigned long lastWeatherPublish = 0;
-
-// Weather data ranges
-#define MIN_TEMPERATURE 15.0
-#define MAX_TEMPERATURE 35.0
-#define MIN_HUMIDITY 30.0
-#define MAX_HUMIDITY 90.0
-#define MIN_PRESSURE 980.0
-#define MAX_PRESSURE 1040.0
-#define MIN_WIND_SPEED 0.0
-#define MAX_WIND_SPEED 20.0
 
 // SD Card pins for A7670G module TF card interface
 #define SD_MISO_PIN 2  // MISO pin
@@ -81,7 +74,7 @@ unsigned long lastSyncAttempt = 0;
 int pendingRecords = 0;
 
 String response, dateTime, year, month, day, hour, minute, second;
-#define TIME_THRESHOLD 70  // Allow up to 70s jump (for 1-min sleep)
+#define TIME_THRESHOLD 120  // Allow up to 120s jump
 String lastValidTime = "";  // Store last valid time
 unsigned long lastEpoch = 0;  // Store last valid epoch timestamp
 
@@ -96,7 +89,11 @@ void handleUpdateCommand(const JsonDocument &doc);
 uint32_t AutoBaud();
 unsigned long convertToEpoch(String year, String month, String day, String hour, String minute, String second);
 void getTime();
+String generateSensorStatusJSON();
+void publishSensorStatus();
+String generateWeatherDataJson();
 void publishWeatherData();
+String generateStatusInfoJSON();
 void publishStatusReport();
 void messageHandler(char *topic, byte *payload, unsigned int length);
 void connectWiFi();
@@ -104,7 +101,6 @@ void connectToAWS();
 bool setupSDCard();
 bool saveWeatherDataToSD(const char *jsonData);
 bool syncOfflineData();
-String generateWeatherDataJson();
 void checkAndSyncData();
 String getNextDataFilename();
 bool deleteDataFile(const String &filename);
@@ -136,11 +132,13 @@ void activateDevice(bool activate)
   preferences.end();
   deviceActivated = activate;
 
+  getTime();
   // Publish activation status
   StaticJsonDocument<200> doc;
   doc["device_id"] = DEVICE_ID;
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["activated"] = activate;
+  doc["recorded_at"] = dateTime;
 
   String jsonStr;
   serializeJson(doc, jsonStr);
@@ -533,39 +531,58 @@ void getTime() {
   }
 }
 
+// Generate sensor status JSON string
+String generateSensorStatusJSON()
+{
+  getTime();
+  StaticJsonDocument<256> doc;
+  doc["recorded_at"] = dateTime;
+
+  // Get sensor status from SensorManager
+  SensorStatus status = sensorManager.getSensorStatus();
+  JsonObject sensors = doc.createNestedObject("sensors");
+  sensors["BME280"] = status.bmeAvailable ? "OK" : "ERROR";
+  sensors["BMP180"] = status.bmpAvailable ? "OK" : "ERROR";
+  sensors["SHT30"] = status.shtAvailable ? "OK" : "ERROR";
+  sensors["BH1750"] = status.lightAvailable ? "OK" : "ERROR";
+  sensors["AS5600"] = status.directionAvailable ? "OK" : "ERROR";
+  sensors["SLAVE"] = status.slaveAvailable ? "OK" : "ERROR";
+  sensors["GUVAS12SD"] = status.uvAvailable ? "OK" : "ERROR";
+
+  String jsonStr;
+  serializeJson(doc, jsonStr);
+  return jsonStr;
+}
+
+// Function to publish sensor status
+void publishSensorStatus()
+{
+  String jsonString = generateSensorStatusJSON();
+
+  // Publish to device-specific status topic
+  mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonString.c_str());
+}
+
 // Generate weather data JSON string
 String generateWeatherDataJson()
 {
-  // Generate random weather data
-  float temperature = random(MIN_TEMPERATURE * 100, MAX_TEMPERATURE * 100) / 100.0;
-  float humidity = random(MIN_HUMIDITY * 100, MAX_HUMIDITY * 100) / 100.0;
-  float pressure = random(MIN_PRESSURE * 10, MAX_PRESSURE * 10) / 10.0;
-  float windSpeed = random(MIN_WIND_SPEED * 100, MAX_WIND_SPEED * 100) / 100.0;
-
-  // Get random wind direction (N, NE, E, SE, S, SW, W, NW)
-  const char *windDirections[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
-  const char *windDirection = windDirections[random(0, 8)];
-
-  // Get random weather condition
-  const char *weatherConditions[] = {"Sunny", "Partly Cloudy", "Cloudy", "Rainy", "Thunderstorm", "Foggy", "Snowy"};
-  const char *weatherCondition = weatherConditions[random(0, 7)];
-
   // Get time
   getTime();
 
   // Create JSON document
   StaticJsonDocument<256> doc;
-  doc["device_id"] = DEVICE_ID;
   doc["recorded_at"] = dateTime;
 
-  // Weather data
-  JsonObject weather = doc.createNestedObject("weather");
-  weather["temperature"] = temperature;
-  weather["humidity"] = humidity;
-  weather["pressure"] = pressure;
-  weather["wind_speed"] = windSpeed;
-  weather["wind_direction"] = windDirection;
-  weather["condition"] = weatherCondition;
+  // Collect sensor data
+  SensorReadings readings = sensorManager.readAllSensors();
+  doc["temperature"] = readings.temperature;
+  doc["humidity"] = readings.humidity;
+  doc["pressure"] = readings.pressure;
+  doc["light_intensity"] = readings.lightIntensity;
+  doc["uv_index"] = readings.uvIndex;
+  doc["wind_direction"] = readings.windDirection;
+  doc["wind_speed"] = readings.windSpeed;
+  doc["precipitation"] = readings.precipitation;
 
   // Serialize to JSON
   String jsonString;
@@ -605,8 +622,8 @@ void publishWeatherData()
   }
 }
 
-// Function to generate status report
-void publishStatusReport()
+// Generate status information JSON string
+String generateStatusInfoJSON()
 {
   const float TOTAL_RAM = 327680.0;
   const float TOTAL_FLASH = 1310720.0;
@@ -624,30 +641,36 @@ void publishStatusReport()
 
   // SD Card status and storage
   const char* SD_CARD = sdCardAvailable ? "Available" : "Not available";
-  int PENDING_RECORDS;
+  int PENDING_RECORDS = 0;
   if (sdCardAvailable)
   {
     PENDING_RECORDS = pendingRecords;
   }
 
-  getTime();
+  getTime(); // Ensure we have the latest time
 
-  StaticJsonDocument<256> doc;
-  doc["device_id"] = DEVICE_ID;
+  StaticJsonDocument<512> doc;
+  doc["recorded_at"] = dateTime;
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["activated"] = deviceActivated;
   doc["ram_usage"] = RAM_USAGE;
   doc["flash_usage"] = FLASH_USAGE;
-  doc["signal_quality"] = SIGNAL_QUALITY;
   doc["sd_card"] = SD_CARD;
   doc["pending_records"] = PENDING_RECORDS;
-  doc["date_time"] = dateTime;
 
-  String jsonStr;
-  serializeJson(doc, jsonStr);
+  // Serialize to JSON
+  String jsonString;
+  serializeJson(doc, jsonString);
+  return jsonString;
+}
+
+// Function to generate status report
+void publishStatusReport()
+{
+  String jsonString = generateStatusInfoJSON();
 
   // Publish to device-specific status topic
-  mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonStr.c_str());
+  mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonString.c_str());
 }
 
 // MQTT message handler
@@ -677,80 +700,129 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
   // Handle based on topic
   if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0)
   {
-    // Handle device reset
-    if (doc.containsKey("reset") && doc["reset"].as<bool>())
-    {
-      // Publish notification that device is restarting
-      publishUpdateStatus("Resetting", "Device restarting per command request");
-
-      Serial.println("Reset command received. Restarting device...");
-
-      // Give time for the MQTT message to be sent
-      delay(1000);
-
-      // Restart the ESP32
-      ESP.restart();
-    }
+    const char* command = doc["command"];
     // Handle status information
-    else if (doc.containsKey("status") && doc["status"].as<bool>())
+    if (command && strcmp(command, "info") == 0)
     {
-      // Respond with current status when requested
-      Serial.println("Status command received.");
       publishStatusReport();
+      Serial.println("Station Information sent.");
+      publishUpdateStatus("Status", "Station information sent successfully");
+    }
+    // Handle sensor status
+    else if (command && strcmp(command, "sensor") == 0)
+    {
+      publishSensorStatus();
+      Serial.println("Sensors status sent.");
+      publishUpdateStatus("Sensor Status", "Sensors status sent successfully");
     }
     // Handle device activation
-    else if (doc.containsKey("activate"))
+    else if (command && strcmp(command, "activate") == 0)
     {
-      bool activateState = doc["activate"].as<bool>();
+      // Activate the device
+      activateDevice(true);
+      Serial.printf("Device activated successfully at %s.\n", dateTime.c_str());
+      publishUpdateStatus("Activated", "Device activated successfully");
+    }
+    // Handle device deactivation
+    else if (command && strcmp(command, "deactivate") == 0)
+    {     
+      // Deactivate the device
+      activateDevice(false);
+      Serial.printf("Device deactivated successfully at %s.\n", dateTime.c_str());
+      publishUpdateStatus("Deactivated", "Device deactivated successfully");
+    }
+    // Commands that require activation
+    else if (!deviceActivated) {
+      Serial.printf("Command '%s' rejected: Device not activated\n", command ? command : "unknown");
+      publishUpdateStatus("Rejected", "Device not activated - command ignored");
+    }
+    else {
+      // Handle device reset
+      if (command && strcmp(command, "reset") == 0)
+      {
+        getTime();
+        StaticJsonDocument<128> resetDoc;
+        resetDoc["recorded_at"] = dateTime;
+        resetDoc["command"] = "reset";
+        String resetJson;
+        serializeJson(resetDoc, resetJson);
+        mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, resetJson.c_str());
+        
+        // Reset the device
+        Serial.printf("Reset command received at %s. Restarting device...\n", dateTime.c_str());
+        publishUpdateStatus("Resetting", "Device restarting per command request");
+        delay(1000);
+        ESP.restart();
+      }
+      // Handle OTA update command
+      else if (command && strcmp(command, "update") == 0)
+      {
+        getTime();
+        StaticJsonDocument<128> updateDoc;
+        updateDoc["recorded_at"] = dateTime;
+        updateDoc["command"] = "update";
+        String updateJson;
+        serializeJson(updateDoc, updateJson);
+        mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, updateJson.c_str());
 
-      // Set activation state based on the boolean value
-      activateDevice(activateState);
+        if (doc["url"].is<const char*>())
+        {
+          handleUpdateCommand(doc);
+          Serial.printf("OTA update command processed at %s.", dateTime.c_str());
+          publishUpdateStatus("OTA Update", "OTA update command processed");
+        }
+        else
+        {
+          Serial.printf("Error: Missing URL for OTA update at %s.", dateTime.c_str());
+          publishUpdateStatus("Error", "Missing url for update");
+        }
+      }
+      // Handle force sync command
+      else if (command && strcmp(command, "sync") == 0)
+      {
+        static unsigned long lastSyncCommandTime = 0;
+        unsigned long now = millis();
+        // Only allow sync command to be processed if at least 10 seconds have passed since last one
+        if (now - lastSyncCommandTime > 10000 || lastSyncCommandTime == 0) {
+          lastSyncCommandTime = now;
 
-      if (activateState)
-      {
-        Serial.println("Device activated successfully");
-        publishUpdateStatus("Activated", "Device activated successfully");
+          getTime();
+          StaticJsonDocument<128> syncDoc;
+          syncDoc["recorded_at"] = dateTime;
+          syncDoc["command"] = "sync";
+          String syncJson;
+          serializeJson(syncDoc, syncJson);
+          mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, syncJson.c_str());
+
+          // Force sync command received
+          Serial.printf("Force sync command received at %s.", dateTime.c_str());
+          publishUpdateStatus("Sync", "Force sync command received");
+          
+          if (syncOfflineData())
+          {
+            Serial.println("Offline data synchronized successfully");
+            publishUpdateStatus("Synced", "Offline data synchronized successfully");
+          }
+          else
+          {
+            Serial.println("Failed to synchronize offline data");
+            publishUpdateStatus("Sync Failed", "Failed to synchronize offline data");
+          }
+          lastSyncAttempt = millis(); // Update last sync attempt time
+        } else {
+          Serial.println("Sync command ignored: too soon since last sync.");
+        }
       }
-      else
+      // Handle force collect data command
+      else if (command && strcmp(command, "data") == 0)
       {
-        Serial.println("Device deactivated");
-        publishUpdateStatus("Deactivated", "Device deactivated");
+        // Respond with current weather data when requested
+        Serial.println("Weather data requested.");
+        String jsonString = generateWeatherDataJson();
+        mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonString.c_str());
+        publishUpdateStatus("Weather Data", "Current weather data sent");
       }
-    }
-    // Handle OTA update command
-    else if (doc.containsKey("update") && doc["update"].as<bool>() == true)
-    {
-      if (doc.containsKey("url"))
-      {
-        // Optional: allow version and force update flags
-        handleUpdateCommand(doc);
-      }
-      else
-      {
-        publishUpdateStatus("Error", "Missing url for update");
-      }
-    }
-    // Handle force sync command
-    else if (doc.containsKey("sync") && doc["sync"].as<bool>() == true)
-    {
-      if (syncOfflineData())
-      {
-        publishUpdateStatus("Synced", "Offline data synchronized successfully");
-      }
-      else
-      {
-        publishUpdateStatus("Sync Failed", "Failed to synchronize offline data");
-      }
-    }
-  }
-  else if (strcmp(topic, AWS_IOT_DEVICE_WEATHER_TOPIC) == 0) {
-    if (doc.containsKey("data") && doc["data"].as<bool>())
-    {
-      // Respond with current status when requested
-      Serial.println("Collecting weather data.");
-      String weatherData = generateWeatherDataJson();
-      publishWeatherData();
-    }
+    }   
   }
   Serial.println("---------------------------------");
 }
@@ -1105,6 +1177,11 @@ void setup()
   // Connect to WiFi and AWS IoT
   initGSM();
   connectToAWS();
+
+  // Initialize sensors
+  sensorManager.begin();
+
+  // Collecting last time
   lastWeatherPublish = millis();
   lastSyncAttempt = millis();
 }
@@ -1137,9 +1214,6 @@ void loop()
     lastWeatherPublish = currentMillis;
     if (deviceActivated)
     {
-      // Always generate data
-      String weatherData = generateWeatherDataJson();
-
       // Try to publish if connected
       if (modem.isNetworkConnected() && mqttClient.connected())
       {
@@ -1149,11 +1223,29 @@ void loop()
       // Otherwise save locally if SD card is available
       else if (sdCardAvailable)
       {
+        // Always generate data
+        String weatherData = generateWeatherDataJson();
         if (saveWeatherDataToSD(weatherData.c_str()))
         {
           Serial.println("Weather data saved to SD card (offline mode)");
           pendingRecords++;
         }
+      }
+    }
+    else {
+      // Device is deactivated - only store locally if SD card is available
+      if (sdCardAvailable)
+      {
+        String weatherData = generateWeatherDataJson();
+        if (saveWeatherDataToSD(weatherData.c_str()))
+        {
+          Serial.println("Weather data collected but stored locally (device deactivated)");
+          pendingRecords++;
+        }
+      }
+      else
+      {
+        Serial.println("Weather data collected but discarded (device deactivated, no SD card)");
       }
     }
   }

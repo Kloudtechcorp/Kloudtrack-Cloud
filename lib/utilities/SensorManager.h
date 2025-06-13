@@ -24,6 +24,7 @@ struct SensorReadings {
     float windDirection;
     float windSpeed;
     float precipitation;
+    float panelTemperature;
 };
 
 struct SensorStatus {
@@ -114,6 +115,7 @@ class SensorManager {
         float readShtHumidity();
         void updateSensorReadings();
         void calculateAverages();
+        void readPanelTemperature();
 
         // Function to read light intensity and UV index
         float readLightIntensity();

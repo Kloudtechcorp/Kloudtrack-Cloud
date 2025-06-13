@@ -1,8 +1,6 @@
 /*
-  Version 2.3.3
-  Sensor Integration for Kloudtrack - GSM
-  - Collected real data instead of random ones
-  - Fixed bug with wind direction calculation
+  Version 2.3.4
+  - Store credentials in Preferences
 */ 
 #include <Arduino.h>
 #include <PubSubClient.h>
@@ -21,7 +19,7 @@ char AWS_IOT_DEVICE_COMMAND_TOPIC[50];
 char AWS_IOT_DEVICE_WEATHER_TOPIC[50];
 
 // Device ID
-#define DEVICE_ID "KT-DEVICE-12345"
+char DEVICE_ID[20];
 
 // Current firmware version
 #define FIRMWARE_VERSION "2.3.3"
@@ -79,6 +77,7 @@ String lastValidTime = "";  // Store last valid time
 unsigned long lastEpoch = 0;  // Store last valid epoch timestamp
 
 // Functions
+void getMacAddress(char* macString);
 void publishUpdateStatus(const char *status, const char *message);
 bool isDeviceActivated();
 void activateDevice(bool activate);
@@ -104,6 +103,14 @@ bool syncOfflineData();
 void checkAndSyncData();
 String getNextDataFilename();
 bool deleteDataFile(const String &filename);
+
+// Function to get MAC address
+void getMacAddress(char* macString) {
+  uint64_t mac = ESP.getEfuseMac();
+  sprintf(macString, "KT-%04X%08X", 
+          (uint16_t)(mac >> 32), 
+          (uint32_t)mac);
+}
 
 // Function to publish status updates
 void publishUpdateStatus(const char *status, const char *message)
@@ -583,6 +590,7 @@ String generateWeatherDataJson()
   doc["wind_direction"] = readings.windDirection;
   doc["wind_speed"] = readings.windSpeed;
   doc["precipitation"] = readings.precipitation;
+  doc["in_temp"] = readings.panelTemperature;
 
   // Serialize to JSON
   String jsonString;
@@ -650,13 +658,14 @@ String generateStatusInfoJSON()
   getTime(); // Ensure we have the latest time
 
   StaticJsonDocument<512> doc;
-  doc["recorded_at"] = dateTime;
-  doc["firmware_version"] = FIRMWARE_VERSION;
+  doc["rec_at"] = dateTime;
+  doc["device_id"] = DEVICE_ID;
+  doc["firmware"] = FIRMWARE_VERSION;
   doc["activated"] = deviceActivated;
-  doc["ram_usage"] = RAM_USAGE;
-  doc["flash_usage"] = FLASH_USAGE;
-  doc["sd_card"] = SD_CARD;
-  doc["pending_records"] = PENDING_RECORDS;
+  doc["ram"] = RAM_USAGE;
+  doc["flash"] = FLASH_USAGE;
+  doc["sd"] = SD_CARD;
+  doc["pending"] = PENDING_RECORDS;
 
   // Serialize to JSON
   String jsonString;
@@ -1155,7 +1164,10 @@ void setup()
   Serial.begin(115200);
   delay(1000);
 
-  // Configure device-specific topics
+  // Get stored device credentials
+  getMacAddress(DEVICE_ID);
+
+  // Configure device-specific topics using stored or default credentials
   snprintf(AWS_IOT_DEVICE_COMMAND_TOPIC, 50, "kloudtrack/%s/command", DEVICE_ID);
   snprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, 50, "kloudtrack/%s/data", DEVICE_ID);
 

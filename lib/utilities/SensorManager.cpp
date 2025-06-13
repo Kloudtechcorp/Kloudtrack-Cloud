@@ -69,7 +69,8 @@ void SensorManager::begin() {
 
     // Initialize Slave Sensor
     Wire.beginTransmission(SLAVE_ADDRESS);
-    if (!Wire.endTransmission() == 0) {
+    byte slaveError = Wire.endTransmission();
+    if (slaveError != 0) {
         Serial.println("Slave failed.");
         slaveReady = false;
     } else {
@@ -107,10 +108,12 @@ SensorReadings SensorManager::readAllSensors() {
     // Function to read wind direction
     performWindMeasurement();
 
+    // Function to read slave sensor data
     updateSlaveReadings();
 
+    // Prepare the SensorReadings structure
     SensorReadings readings;
-
+    // Assigning the sensor readings to the structure
     readings.temperature = averageTemperature;
     readings.humidity = averageHumidity;
     readings.pressure = averagePressure;
@@ -119,7 +122,7 @@ SensorReadings SensorManager::readAllSensors() {
     readings.windDirection = windDirection;
     readings.windSpeed = windSpeed;
     readings.precipitation = precipitation;
-
+    readings.panelTemperature = readBmpTemperature();
     return readings;
 }
 
@@ -217,6 +220,13 @@ int SensorManager::calculateUvIndex() {
 }
 
 void SensorManager::updateSlaveReadings() {
+    Wire.beginTransmission(SLAVE_ADDRESS);
+    byte error = Wire.endTransmission();
+
+    if (error != 0) {
+        return;
+    }
+
     Wire.requestFrom(SLAVE_ADDRESS, 4);
 
     // Get rain count and solve for precipitation
@@ -244,10 +254,6 @@ void SensorManager::calculateAverages() {
 
     if (!isnan(bmeTemperature)) {
         tempSum += bmeTemperature;
-        validTempCount++;
-    }
-    if (!isnan(bmpTemperature)) {
-        tempSum += bmpTemperature;
         validTempCount++;
     }
     if (!isnan(shtTemperature)) {

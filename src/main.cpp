@@ -12,17 +12,8 @@
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
+#include "Config.h"
 #include "SensorManager.h"
-
-// MQTT Topics
-char AWS_IOT_DEVICE_COMMAND_TOPIC[50];
-char AWS_IOT_DEVICE_WEATHER_TOPIC[50];
-
-// Device ID
-char DEVICE_ID[20];
-
-// Current firmware version
-#define FIRMWARE_VERSION "2.3.3"
 
 // Weather data parameters
 SensorManager sensorManager;
@@ -59,6 +50,7 @@ TinyGsmClient baseClient(modem);
 SSLClient sslClient(&baseClient);
 PubSubClient mqttClient(sslClient);
 Preferences preferences;
+Config config;
 
 bool deviceActivated = false;
 bool sdCardAvailable = false;
@@ -77,7 +69,6 @@ String lastValidTime = "";  // Store last valid time
 unsigned long lastEpoch = 0;  // Store last valid epoch timestamp
 
 // Functions
-void getMacAddress(char* macString);
 void publishUpdateStatus(const char *status, const char *message);
 bool isDeviceActivated();
 void activateDevice(bool activate);
@@ -103,14 +94,6 @@ bool syncOfflineData();
 void checkAndSyncData();
 String getNextDataFilename();
 bool deleteDataFile(const String &filename);
-
-// Function to get MAC address
-void getMacAddress(char* macString) {
-  uint64_t mac = ESP.getEfuseMac();
-  sprintf(macString, "KT-%04X%08X", 
-          (uint16_t)(mac >> 32), 
-          (uint32_t)mac);
-}
 
 // Function to publish status updates
 void publishUpdateStatus(const char *status, const char *message)
@@ -142,8 +125,8 @@ void activateDevice(bool activate)
   getTime();
   // Publish activation status
   StaticJsonDocument<200> doc;
-  doc["device_id"] = DEVICE_ID;
-  doc["firmware_version"] = FIRMWARE_VERSION;
+  doc["device_id"] = config.getDeviceId();
+  doc["firmware_version"] = Config::FIRMWARE_VERSION;
   doc["activated"] = activate;
   doc["recorded_at"] = dateTime;
 
@@ -151,7 +134,7 @@ void activateDevice(bool activate)
   serializeJson(doc, jsonStr);
 
   // Publish to device-specific activation topic
-  mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonStr.c_str());
+  mqttClient.publish(config.getAwsIotDeviceCommandTopic(), jsonStr.c_str());
 
   Serial.printf("Device %s\n", activate ? "ACTIVATED" : "DEACTIVATED");
 }
@@ -443,10 +426,10 @@ void handleUpdateCommand(const JsonDocument& doc) {
   }
 
   String url = doc["url"].as<String>();
-  String newVersion = doc.containsKey("version") ? doc["version"].as<String>() : FIRMWARE_VERSION;
+  String newVersion = doc.containsKey("version") ? doc["version"].as<String>() : Config::FIRMWARE_VERSION;
   bool forceUpdate = doc.containsKey("force") ? doc["force"].as<bool>() : false;
 
-  if (!forceUpdate && newVersion == FIRMWARE_VERSION) {
+  if (!forceUpdate && newVersion == Config::FIRMWARE_VERSION) {
     publishUpdateStatus("Ignored", "Same firmware version. Update skipped.");
     return;
   }
@@ -567,7 +550,7 @@ void publishSensorStatus()
   String jsonString = generateSensorStatusJSON();
 
   // Publish to device-specific status topic
-  mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonString.c_str());
+  mqttClient.publish(config.getAwsIotDeviceCommandTopic(), jsonString.c_str());
 }
 
 // Generate weather data JSON string
@@ -606,7 +589,7 @@ void publishWeatherData()
   if (modem.isNetworkConnected() && mqttClient.connected())
   {
     // Publish to device-specific weather topic
-    mqttClient.publish(AWS_IOT_DEVICE_WEATHER_TOPIC, jsonString.c_str());
+    mqttClient.publish(config.getAwsIotDeviceWeatherTopic(), jsonString.c_str());
   }
   else
   {
@@ -659,8 +642,8 @@ String generateStatusInfoJSON()
 
   StaticJsonDocument<512> doc;
   doc["rec_at"] = dateTime;
-  doc["device_id"] = DEVICE_ID;
-  doc["firmware"] = FIRMWARE_VERSION;
+  doc["device_id"] = config.getDeviceId();
+  doc["firmware"] = Config::FIRMWARE_VERSION;
   doc["activated"] = deviceActivated;
   doc["ram"] = RAM_USAGE;
   doc["flash"] = FLASH_USAGE;
@@ -679,7 +662,7 @@ void publishStatusReport()
   String jsonString = generateStatusInfoJSON();
 
   // Publish to device-specific status topic
-  mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonString.c_str());
+  mqttClient.publish(config.getAwsIotDeviceCommandTopic(), jsonString.c_str());
 }
 
 // MQTT message handler
@@ -707,7 +690,7 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
   }
 
   // Handle based on topic
-  if (strcmp(topic, AWS_IOT_DEVICE_COMMAND_TOPIC) == 0)
+  if (strcmp(topic, config.getAwsIotDeviceCommandTopic()) == 0)
   {
     const char* command = doc["command"];
     // Handle status information
@@ -755,7 +738,7 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
         resetDoc["command"] = "reset";
         String resetJson;
         serializeJson(resetDoc, resetJson);
-        mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, resetJson.c_str());
+        mqttClient.publish(config.getAwsIotDeviceCommandTopic(), resetJson.c_str());
         
         // Reset the device
         Serial.printf("Reset command received at %s. Restarting device...\n", dateTime.c_str());
@@ -772,7 +755,7 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
         updateDoc["command"] = "update";
         String updateJson;
         serializeJson(updateDoc, updateJson);
-        mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, updateJson.c_str());
+        mqttClient.publish(config.getAwsIotDeviceCommandTopic(), updateJson.c_str());
 
         if (doc["url"].is<const char*>())
         {
@@ -801,7 +784,7 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
           syncDoc["command"] = "sync";
           String syncJson;
           serializeJson(syncDoc, syncJson);
-          mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, syncJson.c_str());
+          mqttClient.publish(config.getAwsIotDeviceCommandTopic(), syncJson.c_str());
 
           // Force sync command received
           Serial.printf("Force sync command received at %s.", dateTime.c_str());
@@ -828,7 +811,7 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
         // Respond with current weather data when requested
         Serial.println("Weather data requested.");
         String jsonString = generateWeatherDataJson();
-        mqttClient.publish(AWS_IOT_DEVICE_COMMAND_TOPIC, jsonString.c_str());
+        mqttClient.publish(config.getAwsIotDeviceCommandTopic(), jsonString.c_str());
         publishUpdateStatus("Weather Data", "Current weather data sent");
       }
     }   
@@ -922,15 +905,15 @@ void connectToAWS()
       mqttRetryCount++;
       Serial.printf("Reconnecting attempt %d/%d\n", mqttRetryCount, maxRetries);
 
-      if (mqttClient.connect(DEVICE_ID))
+      if (mqttClient.connect(config.getDeviceId()))
       {
         Serial.println("Connected!");
         mqttRetryCount = 0;
         reconnectDelay = 1000;
 
         // Subscribe to all relevant topics
-        mqttClient.subscribe(AWS_IOT_DEVICE_COMMAND_TOPIC);
-        mqttClient.subscribe(AWS_IOT_DEVICE_WEATHER_TOPIC);
+        mqttClient.subscribe(config.getAwsIotDeviceCommandTopic());
+        mqttClient.subscribe(config.getAwsIotDeviceWeatherTopic());
 
         // Check activation status
         deviceActivated = isDeviceActivated();
@@ -1114,7 +1097,7 @@ bool syncOfflineData()
       file.close();
 
       // Publish the data
-      if (mqttClient.publish(AWS_IOT_DEVICE_WEATHER_TOPIC, data.c_str()))
+      if (mqttClient.publish(config.getAwsIotDeviceWeatherTopic(), data.c_str()))
       {
         // Delete the file after successful publish
         if (deleteDataFile(path))
@@ -1164,17 +1147,12 @@ void setup()
   Serial.begin(115200);
   delay(1000);
 
-  // Get stored device credentials
-  getMacAddress(DEVICE_ID);
-
-  // Configure device-specific topics using stored or default credentials
-  snprintf(AWS_IOT_DEVICE_COMMAND_TOPIC, 50, "kloudtrack/%s/command", DEVICE_ID);
-  snprintf(AWS_IOT_DEVICE_WEATHER_TOPIC, 50, "kloudtrack/%s/data", DEVICE_ID);
+  config.begin();
 
   Serial.println("\n---------------------------------");
   Serial.println("ESP32 Weather Station");
-  Serial.printf("Device ID: %s\n", DEVICE_ID);
-  Serial.printf("Current Firmware Version: %s\n", FIRMWARE_VERSION);
+  Serial.printf("Device ID: %s\n", config.getDeviceId());
+  Serial.printf("Current Firmware Version: %s\n", Config::FIRMWARE_VERSION);
   Serial.println("---------------------------------");
 
   // Check activation status

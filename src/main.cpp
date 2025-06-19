@@ -10,6 +10,7 @@
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <FS.h>
+#include "DateTime.h"
 #include "SdCard.h"
 #include "SensorManager.h"
 
@@ -63,10 +64,7 @@ unsigned long reconnectDelay = 1000;
 const unsigned long maxReconnectDelay = 60000;
 unsigned long lastSyncAttempt = 0;
 
-String response, dateTime, year, month, day, hour, minute, second;
-#define TIME_THRESHOLD 120  // Allow up to 120s jump
-String lastValidTime = "";  // Store last valid time
-unsigned long lastEpoch = 0;  // Store last valid epoch timestamp
+DateTime dateTime;
 
 // Functions
 void getMacAddress(char* macString);
@@ -78,8 +76,7 @@ bool testServerConnection(const String &host, int port);
 bool performOTAUpdate(const char *url, const char *expectedChecksum);
 void handleUpdateCommand(const JsonDocument &doc);
 uint32_t AutoBaud();
-unsigned long convertToEpoch(String year, String month, String day, String hour, String minute, String second);
-void getTime();
+void updateDateTime();
 String generateSensorStatusJSON();
 void publishSensorStatus();
 String generateWeatherDataJson();
@@ -126,13 +123,13 @@ void activateDevice(bool activate)
   preferences.end();
   deviceActivated = activate;
 
-  getTime();
+  updateDateTime();
   // Publish activation status
   StaticJsonDocument<200> doc;
   doc["device_id"] = DEVICE_ID;
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["activated"] = activate;
-  doc["recorded_at"] = dateTime;
+  doc["recorded_at"] = dateTime.asStr();
 
   String jsonStr;
   serializeJson(doc, jsonStr);
@@ -463,74 +460,23 @@ uint32_t AutoBaud() {
   return 0;
 }
 
-// Function to convert date/time to UNIX timestamp
-unsigned long convertToEpoch(String year, String month, String day, String hour, String minute, String second) {
-  struct tm t;
-  t.tm_year = year.toInt() + 2000 - 1900;
-  t.tm_mon = month.toInt() - 1;
-  t.tm_mday = day.toInt();
-  t.tm_hour = hour.toInt();
-  t.tm_min = minute.toInt();
-  t.tm_sec = second.toInt();
-  return mktime(&t);
-}
+void updateDateTime() {
+  DateTime dt;
 
-// Function to get the time
-void getTime() {
-  response = "";
-  SerialAT.print("AT+CCLK?\r\n");
-  delay(100);
-  response = SerialAT.readString();
-  if (response != "") {
-    int startIndex = response.indexOf("+CCLK: \"");
-    int endIndex = response.indexOf("\"", startIndex + 8);
-    if (startIndex == -1 || endIndex == -1) return;  // Invalid response
-    String dateTimeString = response.substring(startIndex + 8, endIndex);
-
-    int dayIndex = dateTimeString.indexOf("/");
-    int monthIndex = dateTimeString.indexOf("/", dayIndex + 1);
-    int yearIndex = dateTimeString.indexOf(",");
-
-    String year = dateTimeString.substring(0, dayIndex);
-    String month = dateTimeString.substring(dayIndex + 1, monthIndex);
-    String day = dateTimeString.substring(monthIndex + 1, yearIndex);
-
-    String timeString = dateTimeString.substring(yearIndex + 1);
-
-    int hourIndex = timeString.indexOf(":");
-    int minuteIndex = timeString.indexOf(":", hourIndex + 1);
-
-    String hour = timeString.substring(0, hourIndex);
-    String minute = timeString.substring(hourIndex + 1, minuteIndex);
-    String second = timeString.substring(minuteIndex + 1);
-
-    int plusIndex = second.indexOf("+");
-    if (plusIndex != -1) {
-      second = second.substring(0, plusIndex);
-    }
-
-    // Convert to epoch time
-    unsigned long newEpoch = convertToEpoch(year, month, day, hour, minute, second);
-
-    // Filtering: Ignore large jumps
-    if (lastEpoch == 0 || abs((long)newEpoch - (long)lastEpoch) <= TIME_THRESHOLD) {  
-      lastEpoch = newEpoch;
-      lastValidTime = "20" + year + "-" + month + "-" + day + " " + hour + ":" + minute + ":" + second;
-      dateTime = lastValidTime;
-    } else {
-      Serial.print("Time jump detected ("); 
-      Serial.print(abs((long)newEpoch - (long)lastEpoch));
-      Serial.println("s), ignoring...");  
-    }
+  if (dt.begin(SerialAT) != 0) {
+    Serial.println("Failed to update date and time");
+    return;
   }
+
+  dateTime = dt;
 }
 
 // Generate sensor status JSON string
 String generateSensorStatusJSON()
 {
-  getTime();
+  updateDateTime();
   StaticJsonDocument<256> doc;
-  doc["recorded_at"] = dateTime;
+  doc["recorded_at"] = dateTime.asStr();
 
   // Get sensor status from SensorManager
   SensorStatus status = sensorManager.getSensorStatus();
@@ -561,11 +507,11 @@ void publishSensorStatus()
 String generateWeatherDataJson()
 {
   // Get time
-  getTime();
+  updateDateTime();
 
   // Create JSON document
   StaticJsonDocument<256> doc;
-  doc["recorded_at"] = dateTime;
+  doc["recorded_at"] = dateTime.asStr();
 
   // Collect sensor data
   SensorReadings readings = sensorManager.readAllSensors();
@@ -641,10 +587,10 @@ String generateStatusInfoJSON()
     PENDING_RECORDS = sdCard.getPendingRecords();
   }
 
-  getTime(); // Ensure we have the latest time
+  updateDateTime(); // Ensure we have the latest time
 
   StaticJsonDocument<512> doc;
-  doc["rec_at"] = dateTime;
+  doc["rec_at"] = dateTime.asStr();
   doc["device_id"] = DEVICE_ID;
   doc["firmware"] = FIRMWARE_VERSION;
   doc["activated"] = deviceActivated;
@@ -735,9 +681,9 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
       // Handle device reset
       if (command && strcmp(command, "reset") == 0)
       {
-        getTime();
+        updateDateTime();
         StaticJsonDocument<128> resetDoc;
-        resetDoc["recorded_at"] = dateTime;
+        resetDoc["recorded_at"] = dateTime.asStr();
         resetDoc["command"] = "reset";
         String resetJson;
         serializeJson(resetDoc, resetJson);
@@ -752,9 +698,9 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
       // Handle OTA update command
       else if (command && strcmp(command, "update") == 0)
       {
-        getTime();
+        updateDateTime();
         StaticJsonDocument<128> updateDoc;
-        updateDoc["recorded_at"] = dateTime;
+        updateDoc["recorded_at"] = dateTime.asStr();
         updateDoc["command"] = "update";
         String updateJson;
         serializeJson(updateDoc, updateJson);
@@ -781,9 +727,9 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
         if (now - lastSyncCommandTime > 10000 || lastSyncCommandTime == 0) {
           lastSyncCommandTime = now;
 
-          getTime();
+          updateDateTime();
           StaticJsonDocument<128> syncDoc;
-          syncDoc["recorded_at"] = dateTime;
+          syncDoc["recorded_at"] = dateTime.asStr();
           syncDoc["command"] = "sync";
           String syncJson;
           serializeJson(syncDoc, syncJson);
@@ -881,8 +827,8 @@ void initGSM() {
       delay(60000); // Wait a minute before trying again
     }
   }
-  getTime();
-  Serial.println("Date and Time: " + dateTime);
+  updateDateTime();
+  Serial.printf("Date and Time: %s\n", dateTime.c_str());
   Serial.println("---------------------------------");
 }
   

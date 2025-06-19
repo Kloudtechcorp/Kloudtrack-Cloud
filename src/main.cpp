@@ -573,12 +573,9 @@ String generateStatusInfoJSON()
   updateDateTime(); // Ensure we have the latest time
 
   StaticJsonDocument<512> doc;
-  doc["rec_at"] = dateTime;
+  doc["rec_at"] = dateTime.asStr();
   doc["device_id"] = config.getDeviceId();
   doc["firmware"] = Config::FIRMWARE_VERSION;
-  doc["rec_at"] = dateTime.asStr();
-  doc["device_id"] = DEVICE_ID;
-  doc["firmware"] = FIRMWARE_VERSION;
   doc["activated"] = deviceActivated;
   doc["ram"] = RAM_USAGE;
   doc["flash"] = FLASH_USAGE;

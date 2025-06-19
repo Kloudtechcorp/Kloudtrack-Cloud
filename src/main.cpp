@@ -9,10 +9,10 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
-#include <SPI.h>
-#include <SD.h>
 #include <FS.h>
 #include "Config.h"
+#include "DateTime.h"
+#include "SdCard.h"
 #include "SensorManager.h"
 
 // Weather data parameters
@@ -20,12 +20,6 @@ SensorManager sensorManager;
 #define WEATHER_PUBLISH_INTERVAL 60000
 unsigned long lastWeatherPublish = 0;
 
-// SD Card pins for A7670G module TF card interface
-#define SD_MISO_PIN 2  // MISO pin
-#define SD_MOSI_PIN 15 // MOSI pin
-#define SD_SCLK_PIN 14 // SCLK pin
-#define SD_CS_PIN 13   // CS pin
-#define SD_DATA_DIR "/kloudtrack"
 #define MAX_STORED_ENTRIES 1000 // Limit number of stored entries to prevent memory issues
 #define SYNC_INTERVAL 300000    // Attempt to sync every 5 minutes (300,000 ms)
 
@@ -51,9 +45,9 @@ SSLClient sslClient(&baseClient);
 PubSubClient mqttClient(sslClient);
 Preferences preferences;
 Config config;
+SdCard sdCard;
 
 bool deviceActivated = false;
-bool sdCardAvailable = false;
 bool gsmConnected = false;
 int gsmRetryCount = 0;
 int mqttRetryCount = 0;
@@ -61,12 +55,8 @@ int maxRetries = 5;
 unsigned long reconnectDelay = 1000;
 const unsigned long maxReconnectDelay = 60000;
 unsigned long lastSyncAttempt = 0;
-int pendingRecords = 0;
 
-String response, dateTime, year, month, day, hour, minute, second;
-#define TIME_THRESHOLD 120  // Allow up to 120s jump
-String lastValidTime = "";  // Store last valid time
-unsigned long lastEpoch = 0;  // Store last valid epoch timestamp
+DateTime dateTime;
 
 // Functions
 void publishUpdateStatus(const char *status, const char *message);
@@ -77,8 +67,7 @@ bool testServerConnection(const String &host, int port);
 bool performOTAUpdate(const char *url, const char *expectedChecksum);
 void handleUpdateCommand(const JsonDocument &doc);
 uint32_t AutoBaud();
-unsigned long convertToEpoch(String year, String month, String day, String hour, String minute, String second);
-void getTime();
+void updateDateTime();
 String generateSensorStatusJSON();
 void publishSensorStatus();
 String generateWeatherDataJson();
@@ -86,14 +75,9 @@ void publishWeatherData();
 String generateStatusInfoJSON();
 void publishStatusReport();
 void messageHandler(char *topic, byte *payload, unsigned int length);
-void connectWiFi();
 void connectToAWS();
-bool setupSDCard();
-bool saveWeatherDataToSD(const char *jsonData);
 bool syncOfflineData();
 void checkAndSyncData();
-String getNextDataFilename();
-bool deleteDataFile(const String &filename);
 
 // Function to publish status updates
 void publishUpdateStatus(const char *status, const char *message)
@@ -122,13 +106,13 @@ void activateDevice(bool activate)
   preferences.end();
   deviceActivated = activate;
 
-  getTime();
+  updateDateTime();
   // Publish activation status
   StaticJsonDocument<200> doc;
   doc["device_id"] = config.getDeviceId();
   doc["firmware_version"] = Config::FIRMWARE_VERSION;
   doc["activated"] = activate;
-  doc["recorded_at"] = dateTime;
+  doc["recorded_at"] = dateTime.asStr();
 
   String jsonStr;
   serializeJson(doc, jsonStr);
@@ -459,74 +443,23 @@ uint32_t AutoBaud() {
   return 0;
 }
 
-// Function to convert date/time to UNIX timestamp
-unsigned long convertToEpoch(String year, String month, String day, String hour, String minute, String second) {
-  struct tm t;
-  t.tm_year = year.toInt() + 2000 - 1900;
-  t.tm_mon = month.toInt() - 1;
-  t.tm_mday = day.toInt();
-  t.tm_hour = hour.toInt();
-  t.tm_min = minute.toInt();
-  t.tm_sec = second.toInt();
-  return mktime(&t);
-}
+void updateDateTime() {
+  DateTime dt;
 
-// Function to get the time
-void getTime() {
-  response = "";
-  SerialAT.print("AT+CCLK?\r\n");
-  delay(100);
-  response = SerialAT.readString();
-  if (response != "") {
-    int startIndex = response.indexOf("+CCLK: \"");
-    int endIndex = response.indexOf("\"", startIndex + 8);
-    if (startIndex == -1 || endIndex == -1) return;  // Invalid response
-    String dateTimeString = response.substring(startIndex + 8, endIndex);
-
-    int dayIndex = dateTimeString.indexOf("/");
-    int monthIndex = dateTimeString.indexOf("/", dayIndex + 1);
-    int yearIndex = dateTimeString.indexOf(",");
-
-    String year = dateTimeString.substring(0, dayIndex);
-    String month = dateTimeString.substring(dayIndex + 1, monthIndex);
-    String day = dateTimeString.substring(monthIndex + 1, yearIndex);
-
-    String timeString = dateTimeString.substring(yearIndex + 1);
-
-    int hourIndex = timeString.indexOf(":");
-    int minuteIndex = timeString.indexOf(":", hourIndex + 1);
-
-    String hour = timeString.substring(0, hourIndex);
-    String minute = timeString.substring(hourIndex + 1, minuteIndex);
-    String second = timeString.substring(minuteIndex + 1);
-
-    int plusIndex = second.indexOf("+");
-    if (plusIndex != -1) {
-      second = second.substring(0, plusIndex);
-    }
-
-    // Convert to epoch time
-    unsigned long newEpoch = convertToEpoch(year, month, day, hour, minute, second);
-
-    // Filtering: Ignore large jumps
-    if (lastEpoch == 0 || abs((long)newEpoch - (long)lastEpoch) <= TIME_THRESHOLD) {  
-      lastEpoch = newEpoch;
-      lastValidTime = "20" + year + "-" + month + "-" + day + " " + hour + ":" + minute + ":" + second;
-      dateTime = lastValidTime;
-    } else {
-      Serial.print("Time jump detected ("); 
-      Serial.print(abs((long)newEpoch - (long)lastEpoch));
-      Serial.println("s), ignoring...");  
-    }
+  if (dt.begin(SerialAT) != 0) {
+    Serial.println("Failed to update date and time");
+    return;
   }
+
+  dateTime = dt;
 }
 
 // Generate sensor status JSON string
 String generateSensorStatusJSON()
 {
-  getTime();
+  updateDateTime();
   StaticJsonDocument<256> doc;
-  doc["recorded_at"] = dateTime;
+  doc["recorded_at"] = dateTime.asStr();
 
   // Get sensor status from SensorManager
   SensorStatus status = sensorManager.getSensorStatus();
@@ -557,11 +490,11 @@ void publishSensorStatus()
 String generateWeatherDataJson()
 {
   // Get time
-  getTime();
+  updateDateTime();
 
   // Create JSON document
   StaticJsonDocument<256> doc;
-  doc["recorded_at"] = dateTime;
+  doc["recorded_at"] = dateTime.asStr();
 
   // Collect sensor data
   SensorReadings readings = sensorManager.readAllSensors();
@@ -594,12 +527,11 @@ void publishWeatherData()
   else
   {
     // Save to SD card if WiFi or MQTT is not available
-    if (sdCardAvailable)
+    if (sdCard.isAvailable())
     {
-      if (saveWeatherDataToSD(jsonString.c_str()))
+      if (sdCard.saveWeatherData(jsonString.c_str()))
       {
         Serial.println("Weather data saved to SD card (offline mode)");
-        pendingRecords++;
       }
       else
       {
@@ -631,19 +563,22 @@ String generateStatusInfoJSON()
   int SIGNAL_QUALITY = modem.getSignalQuality();
 
   // SD Card status and storage
-  const char* SD_CARD = sdCardAvailable ? "Available" : "Not available";
+  const char* SD_CARD = sdCard.isAvailable() ? "Available" : "Not available";
   int PENDING_RECORDS = 0;
-  if (sdCardAvailable)
+  if (sdCard.isAvailable())
   {
-    PENDING_RECORDS = pendingRecords;
+    PENDING_RECORDS = sdCard.getPendingRecords();
   }
 
-  getTime(); // Ensure we have the latest time
+  updateDateTime(); // Ensure we have the latest time
 
   StaticJsonDocument<512> doc;
   doc["rec_at"] = dateTime;
   doc["device_id"] = config.getDeviceId();
   doc["firmware"] = Config::FIRMWARE_VERSION;
+  doc["rec_at"] = dateTime.asStr();
+  doc["device_id"] = DEVICE_ID;
+  doc["firmware"] = FIRMWARE_VERSION;
   doc["activated"] = deviceActivated;
   doc["ram"] = RAM_USAGE;
   doc["flash"] = FLASH_USAGE;
@@ -732,9 +667,9 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
       // Handle device reset
       if (command && strcmp(command, "reset") == 0)
       {
-        getTime();
+        updateDateTime();
         StaticJsonDocument<128> resetDoc;
-        resetDoc["recorded_at"] = dateTime;
+        resetDoc["recorded_at"] = dateTime.asStr();
         resetDoc["command"] = "reset";
         String resetJson;
         serializeJson(resetDoc, resetJson);
@@ -749,9 +684,9 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
       // Handle OTA update command
       else if (command && strcmp(command, "update") == 0)
       {
-        getTime();
+        updateDateTime();
         StaticJsonDocument<128> updateDoc;
-        updateDoc["recorded_at"] = dateTime;
+        updateDoc["recorded_at"] = dateTime.asStr();
         updateDoc["command"] = "update";
         String updateJson;
         serializeJson(updateDoc, updateJson);
@@ -778,9 +713,9 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
         if (now - lastSyncCommandTime > 10000 || lastSyncCommandTime == 0) {
           lastSyncCommandTime = now;
 
-          getTime();
+          updateDateTime();
           StaticJsonDocument<128> syncDoc;
-          syncDoc["recorded_at"] = dateTime;
+          syncDoc["recorded_at"] = dateTime.asStr();
           syncDoc["command"] = "sync";
           String syncJson;
           serializeJson(syncDoc, syncJson);
@@ -864,13 +799,12 @@ void initGSM() {
       Serial.println("Maximum GSM retries reached. Continuing in offline mode.");
 
       // Collect weather data before attempting further reconnections
-      if (deviceActivated && sdCardAvailable)
+      if (deviceActivated && sdCard.isAvailable())
       {
         String weatherData = generateWeatherDataJson();
-        if (saveWeatherDataToSD(weatherData.c_str()))
+        if (sdCard.saveWeatherData(weatherData.c_str()))
         {
           Serial.println("Weather data saved to SD card while offline");
-          pendingRecords++;
         }
       }
 
@@ -879,8 +813,8 @@ void initGSM() {
       delay(60000); // Wait a minute before trying again
     }
   }
-  getTime();
-  Serial.println("Date and Time: " + dateTime);
+  updateDateTime();
+  Serial.printf("Date and Time: %s\n", dateTime.c_str());
   Serial.println("---------------------------------");
 }
   
@@ -939,117 +873,10 @@ void connectToAWS()
   }
 }
 
-// Initialize SD card
-bool setupSDCard()
-{
-  Serial.println("Initializing SD card...");
-
-  // Configure SPI pins explicitly for this board (A7670G)
-  SPI.begin(SD_SCLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-
-  // Initialize SD card with the CS pin
-  SD.end();
-  if (!SD.begin(SD_CS_PIN))
-  {
-    Serial.println("SD Card initialization failed!");
-    return false;
-  }
-
-  Serial.println("SD Card initialized successfully");
-
-  // Create data directory if it doesn't exist
-  if (!SD.exists(SD_DATA_DIR))
-  {
-    if (SD.mkdir(SD_DATA_DIR))
-    {
-      Serial.printf("Created directory: %s\n", SD_DATA_DIR);
-    }
-    else
-    {
-      Serial.printf("Failed to create directory: %s\n", SD_DATA_DIR);
-      return false;
-    }
-  }
-
-  // Count existing data files
-  pendingRecords = 0;
-  File root = SD.open(SD_DATA_DIR);
-  if (root)
-  {
-    File file = root.openNextFile();
-    while (file)
-    {
-      pendingRecords++;
-      file.close();
-      file = root.openNextFile();
-    }
-    root.close();
-  }
-
-  Serial.printf("Found %d pending data records\n", pendingRecords);
-  return true;
-}
-
-// Generate a unique filename for data storage
-String getNextDataFilename()
-{
-  char filename[32];
-  sprintf(filename, "%s/data_%lu.json", SD_DATA_DIR, millis());
-  return String(filename);
-}
-
-// Save weather data to SD card
-bool saveWeatherDataToSD(const char *jsonData)
-{
-  if (!sdCardAvailable)
-  {
-    return false;
-  }
-
-  // Generate a filename
-  String filename = getNextDataFilename();
-
-  // Save the data
-  File dataFile = SD.open(filename, FILE_WRITE);
-  if (!dataFile)
-  {
-    Serial.printf("Failed to open file for writing: %s\n", filename.c_str());
-    return false;
-  }
-
-  if (dataFile.print(jsonData))
-  {
-    dataFile.close();
-    Serial.printf("Data saved to %s\n", filename.c_str());
-    return true;
-  }
-  else
-  {
-    dataFile.close();
-    Serial.printf("Failed to write to %s\n", filename.c_str());
-    return false;
-  }
-}
-
-// Delete a data file after successful sync
-bool deleteDataFile(const String &filename)
-{
-  if (SD.remove(filename))
-  {
-    Serial.printf("Deleted file: %s\n", filename.c_str());
-    return true;
-  }
-  else
-  {
-    Serial.printf("Failed to delete file: %s\n", filename.c_str());
-    return false;
-  }
-}
-
 // Sync offline data with cloud
 bool syncOfflineData()
 {
-  if (!sdCardAvailable)
+  if (!sdCard.isAvailable())
   {
     Serial.println("SD card not available for syncing");
     return false;
@@ -1064,7 +891,7 @@ bool syncOfflineData()
   Serial.println("Starting data synchronization...");
 
   int syncedCount = 0;
-  File root = SD.open(SD_DATA_DIR);
+  File root = sdCard.openDataDir();
   if (!root)
   {
     Serial.println("Failed to open data directory");
@@ -1088,7 +915,6 @@ bool syncOfflineData()
     if (!file.isDirectory())
     {
       // Read the file content
-      String path = String(SD_DATA_DIR) + "/" + String(file.name());
       String data = "";
       while (file.available())
       {
@@ -1100,15 +926,14 @@ bool syncOfflineData()
       if (mqttClient.publish(config.getAwsIotDeviceWeatherTopic(), data.c_str()))
       {
         // Delete the file after successful publish
-        if (deleteDataFile(path))
+        if (sdCard.deleteDataFile(file.name()))
         {
           syncedCount++;
-          pendingRecords--;
         }
       }
       else
       {
-        Serial.printf("Failed to publish data from file: %s\n", path.c_str());
+        Serial.printf("Failed to publish data from file: %s\n", file.name());
       }
     }
     else
@@ -1129,7 +954,7 @@ bool syncOfflineData()
 // Check connectivity and sync data when available
 void checkAndSyncData()
 {
-  if (modem.isNetworkConnected() && mqttClient.connected() && pendingRecords > 0)
+  if (modem.isNetworkConnected() && mqttClient.connected() && sdCard.getPendingRecords() > 0)
   {
     unsigned long currentMillis = millis();
     if (currentMillis - lastSyncAttempt >= SYNC_INTERVAL)
@@ -1160,8 +985,8 @@ void setup()
   Serial.printf("Device activation status: %s\n", deviceActivated ? "ACTIVATED" : "NOT ACTIVATED");
 
   // Initialize SD card
-  sdCardAvailable = setupSDCard();
-  Serial.printf("SD Card status: %s\n", sdCardAvailable ? "AVAILABLE" : "NOT AVAILABLE");
+  sdCard.begin();
+  Serial.printf("SD Card status: %s\n", sdCard.isAvailable() ? "AVAILABLE" : "NOT AVAILABLE");
   Serial.println("---------------------------------");
 
   // Connect to WiFi and AWS IoT
@@ -1211,26 +1036,24 @@ void loop()
         Serial.println("Weather data published to MQTT");
       }
       // Otherwise save locally if SD card is available
-      else if (sdCardAvailable)
+      else if (sdCard.isAvailable())
       {
         // Always generate data
         String weatherData = generateWeatherDataJson();
-        if (saveWeatherDataToSD(weatherData.c_str()))
+        if (sdCard.saveWeatherData(weatherData.c_str()))
         {
           Serial.println("Weather data saved to SD card (offline mode)");
-          pendingRecords++;
         }
       }
     }
     else {
       // Device is deactivated - only store locally if SD card is available
-      if (sdCardAvailable)
+      if (sdCard.isAvailable())
       {
         String weatherData = generateWeatherDataJson();
-        if (saveWeatherDataToSD(weatherData.c_str()))
+        if (sdCard.saveWeatherData(weatherData.c_str()))
         {
           Serial.println("Weather data collected but stored locally (device deactivated)");
-          pendingRecords++;
         }
       }
       else

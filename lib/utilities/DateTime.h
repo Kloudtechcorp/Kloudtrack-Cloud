@@ -5,14 +5,12 @@
 class DateTime
 {
 private:
-    static constexpr int TIME_THRESHOLD = 120; // Allow up to 120s jump
-
-    String _inner = "";
+    String _inner;
 
 public:
     DateTime();
-
-    int begin(HardwareSerial &serial);
+    DateTime(const String &year, const String &month, const String &day, const String &hour, const String &minute, const String &second);
+    DateTime(int year, int month, int day, int hour, int minute, int second);
 
     inline const char *c_str() const
     {

@@ -12,3 +12,7 @@
 
 1. Make sure the device is connected to the computer and detectable by PlatformIO.
 2. Run `PlatformIO: Upload` or `PlatformIO: Upload and Monitor` in VSCode to upload the firmware to the device.
+
+## Compilation Flags
+
+- `USE_WIFI`: Replaces GSM connection with WiFi connection.

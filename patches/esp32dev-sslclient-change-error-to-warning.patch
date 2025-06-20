@@ -1,0 +1,11 @@
+--- ssl_client.cpp
++++ ssl_client.cpp
+@@ -19,7 +19,7 @@
+ 
+ 
+ #ifndef MBEDTLS_KEY_EXCHANGE__SOME__PSK_ENABLED
+-#  error "Please configure IDF framework to include mbedTLS -> Enable pre-shared-key ciphersuites and activate at least one cipher"
++#  warning "Please configure IDF framework to include mbedTLS -> Enable pre-shared-key ciphersuites and activate at least one cipher"
+ #endif
+ 
+ const char *pers = "esp32-tls";

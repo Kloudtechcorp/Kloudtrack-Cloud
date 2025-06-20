@@ -1,3 +1,5 @@
+#pragma once
+
 #include <pgmspace.h>
 
 #define SECRET

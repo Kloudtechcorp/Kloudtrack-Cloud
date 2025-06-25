@@ -410,10 +410,10 @@ void handleUpdateCommand(const JsonDocument& doc) {
   }
 
   String url = doc["url"].as<String>();
-  String newVersion = doc.containsKey("version") ? doc["version"].as<String>() : Config::FIRMWARE_VERSION;
+  String newVersion = doc.containsKey("version") ? doc["version"].as<String>() : "";
   bool forceUpdate = doc.containsKey("force") ? doc["force"].as<bool>() : false;
 
-  if (!forceUpdate && newVersion == Config::FIRMWARE_VERSION) {
+  if (!forceUpdate && !newVersion.isEmpty() && newVersion == Config::FIRMWARE_VERSION) {
     publishUpdateStatus("Ignored", "Same firmware version. Update skipped.");
     return;
   }
@@ -681,23 +681,28 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
       // Handle OTA update command
       else if (command && strcmp(command, "update") == 0)
       {
-        updateDateTime();
-        StaticJsonDocument<128> updateDoc;
-        updateDoc["recorded_at"] = dateTime.asStr();
-        updateDoc["command"] = "update";
-        String updateJson;
-        serializeJson(updateDoc, updateJson);
-        mqttClient.publish(config.getAwsIotDeviceCommandTopic(), updateJson.c_str());
-
-        if (doc["url"].is<const char*>())
+        if (doc.containsKey("url"))
         {
+          updateDateTime();
+          StaticJsonDocument<128> updateDoc;
+          updateDoc["recorded_at"] = dateTime.asStr();
+          updateDoc["command"] = "update";
+          updateDoc["status"] = "received";
+          updateDoc["url"] = doc["url"].as<String>();
+          if (doc.containsKey("version")) {
+            updateDoc["version"] = doc["version"].as<String>();
+          }
+          String updateJson;
+          serializeJson(updateDoc, updateJson);
+          mqttClient.publish(config.getAwsIotDeviceCommandTopic(), updateJson.c_str());
+
           handleUpdateCommand(doc);
-          Serial.printf("OTA update command processed at %s.", dateTime.c_str());
+          Serial.printf("OTA update command processed at %s.\n", dateTime.c_str());
           publishUpdateStatus("OTA Update", "OTA update command processed");
         }
         else
         {
-          Serial.printf("Error: Missing URL for OTA update at %s.", dateTime.c_str());
+          Serial.printf("Error: Missing URL for OTA update at %s.\n", dateTime.c_str());
           publishUpdateStatus("Error", "Missing url for update");
         }
       }

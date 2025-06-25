@@ -144,30 +144,35 @@ void SensorManager::updateSensorReadings() {
 
 float SensorManager::readBmeTemperature() {
     if (!bmeReady) return NAN;
+    float bmeTemperatureCalibrationFactor = 0.0f;
     float t = bme.readTemperature();
     return isnan(t) ? NAN : t;
 }
 
 float SensorManager::readBmeHumidity() {
     if (!bmeReady) return NAN;
+    float bmeHumidityCalibrationFactor = 0.0f;
     float h = bme.readHumidity();
     return isnan(h) ? NAN : h;
 }
 
 float SensorManager::readBmePressure() {
     if (!bmeReady) return NAN;
+    float bmePressureCalibrationFactor = 0.0f;
     float p = bme.readPressure() / 100.0F;
     return isnan(p) ? NAN : p;
 }
 
 float SensorManager::readBmpTemperature() {
     if (!bmpReady) return NAN;
+    float bmpTemperatureCalibrationFactor = 0.0f;
     float t = bmp.readTemperature();
     return isnan(t) ? NAN : t;
 }
 
 float SensorManager::readBmpPressure() {
     if (!bmpReady) return NAN;
+    float bmpPressureCalibrationFactor = 0.0f;
     float p = bmp.readPressure() / 100.0F;
     return isnan(p) ? NAN : p;
 }
@@ -176,6 +181,7 @@ float SensorManager::readShtTemperature() {
     if (!shtReady) return NAN;
     uint32_t start, stop;
     start = micros(); sht.read(); stop = micros();
+    float shtTemperatureCalibrationFactor = 0.0f;
     float t = sht.getTemperature();
     return isnan(t) ? NAN : t;
 }
@@ -184,6 +190,7 @@ float SensorManager::readShtHumidity() {
     if (!shtReady) return NAN;
     uint32_t start, stop;
     start = micros(); sht.read(); stop = micros();
+    float shtHumidityCalibrationFactor = 0.0f;
     float h = sht.getHumidity();
     return isnan(h) ? NAN : h;
 }
@@ -243,7 +250,7 @@ void SensorManager::updateSlaveReadings() {
         byte lsb = Wire.read();
         windCount = (msb << 8) | lsb;
     }
-    circumference = 2 * PI * radius * calibrationFactor;
+    circumference = 2 * PI * radius * windSpeedCalibrationFactor;
     windSpeed = ((circumference * windCount * 3.6) / period);
 }
 

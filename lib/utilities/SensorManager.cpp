@@ -45,8 +45,16 @@ void SensorManager::begin() {
 
     // Initialize GUVA-S12SD Sensor
     analogReadResolution(12);
-    int raw = analogRead(UV_PIN);
-    if (raw < 0 || raw > 4095) {
+    analogSetAttenuation(ADC_11db);
+    int sensorValue = 0;
+    for (int i = 0; i < 10; i++) {
+        sensorValue += analogRead(UV_PIN);
+        delay(10);
+    }
+    sensorValue /= 10;
+
+    float voltage = (sensorValue * 3.3) / 4095.0;
+    if (voltage < 0.1 || voltage > 3.25) {
         Serial.println("GUVA-S12SD failed.");
         uvReady = false;
     } else {
@@ -203,9 +211,15 @@ float SensorManager::readLightIntensity() {
 
 float SensorManager::readUvIntensity() {
     if (!uvReady) return NAN;
-    int raw = analogRead(UV_PIN);
-    if (raw < 0 || raw > 4095) return NAN;
-    uvIntensity = (raw * (3.3 / 4095.0)) * 1000.0;
+    int sensorValue = 0;
+    for (int i = 0; i < 10; i++) {
+        sensorValue += analogRead(UV_PIN);
+        delay(10);
+    }
+    sensorValue /= 10;
+    float voltage = (sensorValue * 3.3) / 4095.0;
+    float uvIntensity = voltage * 1000.0;
+    if (sensorValue < 150 || sensorValue > 4000) return NAN;
     return isnan(uvIntensity) ? NAN : uvIntensity;
 }
 

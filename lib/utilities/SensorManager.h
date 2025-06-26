@@ -100,7 +100,7 @@ class SensorManager {
         uint16_t rainCount = 0;
         float windSpeed = NAN;
         float circumference;
-        const float calibrationFactor = 2.4845;
+        const float windSpeedCalibrationFactor = 2.4845;
         const float radius = 0.05f;
         const int period = 60;
         uint16_t windCount = 0;

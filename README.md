@@ -12,3 +12,39 @@
 
 1. Make sure the device is connected to the computer and detectable by PlatformIO.
 2. Run `PlatformIO: Upload` or `PlatformIO: Upload and Monitor` in VSCode to upload the firmware to the device.
+
+## Features
+
+### Credential Management (v2.3.4+)
+
+The system now supports dynamic credential management through the preferences library with MQTT commands:
+
+- **WiFi Credentials**: Set and retrieve WiFi SSID and password
+- **GSM Credentials**: Set and retrieve GSM APN settings  
+- **AWS Credentials**: Set and retrieve AWS IoT endpoint and port
+- **Automatic Fallback**: Uses hardcoded defaults if no custom credentials are stored
+- **Remote Management**: Update credentials via MQTT commands
+- **Persistent Storage**: Credentials survive device restarts
+
+For detailed usage instructions, see [CREDENTIAL_MANAGEMENT.md](CREDENTIAL_MANAGEMENT.md).
+
+### Quick Start - Setting Credentials
+
+1. Activate your device first
+2. Use MQTT commands to set credentials:
+
+```json
+// Set WiFi
+{"command": "set_wifi", "ssid": "YourWiFi", "password": "YourPassword"}
+
+// Set GSM APN
+{"command": "set_gsm", "apn": "internet"}
+
+// Set AWS
+{"command": "set_aws", "endpoint": "your-endpoint.iot.region.amazonaws.com", "port": 8883}
+
+// Get current credentials
+{"command": "get_credentials"}
+```
+
+See the test script `test_credentials.py` for complete examples.

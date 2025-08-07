@@ -86,6 +86,11 @@ void publishUpdateStatus(const char *status, const char *message)
   doc["status"] = status;
   doc["message"] = message;
 
+  // Publish to device-specific activation topic
+  String jsonStr;
+  serializeJson(doc, jsonStr);
+  mqttClient.publish(config.getAwsIotDeviceResponseTopic(), jsonStr.c_str());
+
   Serial.printf("Published status: %s - %s\n", status, message);
 }
 
@@ -118,7 +123,7 @@ void activateDevice(bool activate)
   serializeJson(doc, jsonStr);
 
   // Publish to device-specific activation topic
-  mqttClient.publish(config.getAwsIotDeviceCommandTopic(), jsonStr.c_str());
+  mqttClient.publish(config.getAwsIotDeviceResponseTopic(), jsonStr.c_str());
 
   Serial.printf("Device %s\n", activate ? "ACTIVATED" : "DEACTIVATED");
 }
@@ -483,7 +488,7 @@ void publishSensorStatus()
   String jsonString = generateSensorStatusJSON();
 
   // Publish to device-specific status topic
-  mqttClient.publish(config.getAwsIotDeviceCommandTopic(), jsonString.c_str());
+  mqttClient.publish(config.getAwsIotDeviceResponseTopic(), jsonString.c_str());
 }
 
 // Generate weather data JSON string
@@ -594,7 +599,7 @@ void publishStatusReport()
   String jsonString = generateStatusInfoJSON();
 
   // Publish to device-specific status topic
-  mqttClient.publish(config.getAwsIotDeviceCommandTopic(), jsonString.c_str());
+  mqttClient.publish(config.getAwsIotDeviceResponseTopic(), jsonString.c_str());
 }
 
 // MQTT message handler
@@ -751,6 +756,84 @@ void messageHandler(char *topic, byte *payload, unsigned int length)
         mqttClient.publish(config.getAwsIotDeviceCommandTopic(), jsonString.c_str());
         publishUpdateStatus("Weather Data", "Current weather data sent");
       }
+      // Handle credential management commands
+      else if (command && strcmp(command, "set_wifi") == 0)
+      {
+        if (doc.containsKey("ssid") && doc.containsKey("password")) {
+          String ssid = doc["ssid"].as<String>();
+          String password = doc["password"].as<String>();
+          
+          if (config.setWifiCredentials(ssid.c_str(), password.c_str())) {
+            Serial.printf("WiFi credentials updated: %s\n", ssid.c_str());
+            publishUpdateStatus("WiFi Updated", "WiFi credentials updated successfully");
+          } else {
+            Serial.println("Failed to update WiFi credentials");
+            publishUpdateStatus("WiFi Error", "Failed to update WiFi credentials");
+          }
+        } else {
+          Serial.println("Missing SSID or password for WiFi update");
+          publishUpdateStatus("WiFi Error", "Missing SSID or password");
+        }
+      }
+      else if (command && strcmp(command, "set_gsm") == 0)
+      {
+        if (doc.containsKey("apn")) {
+          String apn = doc["apn"].as<String>();
+          
+          if (config.setGsmCredentials(apn.c_str())) {
+            Serial.printf("GSM APN updated: %s\n", apn.c_str());
+            publishUpdateStatus("GSM Updated", "GSM APN updated successfully");
+          } else {
+            Serial.println("Failed to update GSM APN");
+            publishUpdateStatus("GSM Error", "Failed to update GSM APN");
+          }
+        } else {
+          Serial.println("Missing APN for GSM update");
+          publishUpdateStatus("GSM Error", "Missing APN");
+        }
+      }
+      else if (command && strcmp(command, "set_aws") == 0)
+      {
+        if (doc.containsKey("endpoint") && doc.containsKey("port")) {
+          String endpoint = doc["endpoint"].as<String>();
+          int port = doc["port"].as<int>();
+          
+          if (config.setAwsCredentials(endpoint.c_str(), port)) {
+            Serial.printf("AWS credentials updated: %s:%d\n", endpoint.c_str(), port);
+            publishUpdateStatus("AWS Updated", "AWS credentials updated successfully");
+          } else {
+            Serial.println("Failed to update AWS credentials");
+            publishUpdateStatus("AWS Error", "Failed to update AWS credentials");
+          }
+        } else {
+          Serial.println("Missing endpoint or port for AWS update");
+          publishUpdateStatus("AWS Error", "Missing endpoint or port");
+        }
+      }
+      else if (command && strcmp(command, "get_credentials") == 0)
+      {
+        // Send current credentials status
+        StaticJsonDocument<256> credDoc;
+        credDoc["command"] = "credentials_status";
+        credDoc["wifi_configured"] = config.hasWifiCredentials();
+        credDoc["gsm_configured"] = config.hasGsmCredentials();
+        credDoc["aws_configured"] = config.hasAwsCredentials();
+        credDoc["wifi_ssid"] = config.getWifiSsid();
+        credDoc["gsm_apn"] = config.getApn();
+        credDoc["aws_endpoint"] = config.getAwsIotEndpoint();
+        credDoc["aws_port"] = config.getAwsIotPort();
+        
+        String credJson;
+        serializeJson(credDoc, credJson);
+        mqttClient.publish(config.getAwsIotDeviceCommandTopic(), credJson.c_str());
+        publishUpdateStatus("Credentials", "Current credentials status sent");
+      }
+      else if (command && strcmp(command, "clear_credentials") == 0)
+      {
+        config.clearCredentials();
+        Serial.println("All credentials cleared, using defaults");
+        publishUpdateStatus("Credentials Cleared", "All credentials cleared, using defaults");
+      }
     }   
   }
   Serial.println("---------------------------------");
@@ -778,7 +861,7 @@ void initGSM() {
   delay(2000); // Wait for the modem to initialize
 
   Serial.println("Connecting to cellular network...");
-  modem.gprsConnect(APN);
+  modem.gprsConnect(config.getApn());
   unsigned long gsmStart = millis();
   while (!modem.isNetworkConnected() && (millis() - gsmStart < 10000))
   {
@@ -826,7 +909,7 @@ void connectToAWS()
   if (modem.isNetworkConnected())
   {
     SerialMon.println("Connecting to AWS IoT...");
-    mqttClient.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
+    mqttClient.setServer(config.getAwsIotEndpoint(), config.getAwsIotPort());
     mqttClient.setCallback(messageHandler);
 
     if (!sslClient.connected()) {
@@ -989,6 +1072,9 @@ void setup()
   // Initialize SD card
   sdCard.begin();
   Serial.printf("SD Card status: %s\n", sdCard.isAvailable() ? "AVAILABLE" : "NOT AVAILABLE");
+  
+  // Print current credentials (for debugging)
+  config.printCredentials();
   Serial.println("---------------------------------");
 
   // Connect to WiFi and AWS IoT

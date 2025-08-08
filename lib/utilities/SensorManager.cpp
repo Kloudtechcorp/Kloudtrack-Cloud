@@ -52,14 +52,15 @@ void SensorManager::begin() {
         delay(10);
     }
     sensorValue /= 10;
-
     float voltage = (sensorValue * 3.3) / 4095.0;
-    if (voltage < 0.1 || voltage > 3.25) {
-        Serial.println("GUVA-S12SD failed.");
-        uvReady = false;
-    } else {
+    float uvIntensity = voltage * 1000.0;
+    if (uvIntensity < 50 && uvIntensity >= 1170) {
         Serial.println("GUVA-S12SD ready.");
         uvReady = true;
+    } 
+    else { 
+        Serial.println("GUVA-S12SD failed.");
+        uvReady = false;
     }
 
     // Initialize AS5600 Sensor
@@ -122,11 +123,12 @@ SensorReadings SensorManager::readAllSensors() {
     // Prepare the SensorReadings structure
     SensorReadings readings;
     // Assigning the sensor readings to the structure
+    float uvIndexValue = (guvaUv == -1) ? NAN : guvaUv;
     readings.temperature = averageTemperature;
     readings.humidity = averageHumidity;
     readings.pressure = averagePressure;
     readings.lightIntensity = readLightIntensity();
-    readings.uvIndex = guvaUv;
+    readings.uvIndex = uvIndexValue;
     readings.windDirection = windDirection;
     readings.windSpeed = windSpeed;
     readings.precipitation = precipitation;

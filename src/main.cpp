@@ -999,7 +999,7 @@ bool syncOfflineData()
 
     if (!file.isDirectory())
     {
-      // Read the file content
+      String filename = file.name(); // Save before closing
       String data = "";
       while (file.available())
       {
@@ -1007,18 +1007,16 @@ bool syncOfflineData()
       }
       file.close();
 
-      // Publish the data
       if (mqttClient.publish(config.getAwsIotDeviceWeatherTopic(), data.c_str()))
       {
-        // Delete the file after successful publish
-        if (sdCard.deleteDataFile(file.name()))
+        if (sdCard.deleteDataFile(filename.c_str()))
         {
           syncedCount++;
         }
       }
       else
       {
-        Serial.printf("Failed to publish data from file: %s\n", file.name());
+          Serial.printf("Failed to publish data from file: %s\n", filename.c_str());
       }
     }
     else
@@ -1026,7 +1024,6 @@ bool syncOfflineData()
       file.close();
     }
 
-    // Get next file
     file = root.openNextFile();
   }
 

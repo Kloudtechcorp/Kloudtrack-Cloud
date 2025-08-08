@@ -188,13 +188,13 @@ void Config::clearCredentials()
 
 void Config::printCredentials()
 {
-    Serial.println("=== Current Credentials ===");
+    Serial.println("---------------------------------");
+    Serial.println("Current Credentials");
     Serial.printf("WiFi SSID: %s\n", _wifiSsid);
     Serial.printf("WiFi Password: %s\n", strlen(_wifiPassword) > 0 ? "***SET***" : "NOT SET");
     Serial.printf("GSM APN: %s\n", _apn);
     Serial.printf("AWS Endpoint: %s\n", _awsIotEndpoint);
     Serial.printf("AWS Port: %d\n", _awsIotPort);
-    Serial.println("==========================");
 }
 
 Config::Config()

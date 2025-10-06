@@ -1,0 +1,239 @@
+#include "dependencies.h"
+
+// Connection objects
+GsmConnection gsmConnection;
+AwsConnection* awsConnection = nullptr;
+MqttUtils* mqttUtils = nullptr;
+
+// Weather parameters
+TestSensorManager testSensorManager;
+#define WEATHER_UPDATE_INTERVAL 60000
+unsigned long lastWeatherUpdate = 0;
+
+// Device state
+bool deviceActivated = false;
+
+void setup() {
+    esp_task_wdt_init(60, true); // 60s watchdog
+    SerialMon.begin(115200);
+    delay(1000);
+    esp_task_wdt_reset(); // Reset after serial init
+
+    SerialMon.println("\n---------------------------------");
+    SerialMon.println("Starting Kloudtrack Weather Station...");
+
+    // Initialize SPIFFS filesystem first
+    SerialMon.println("-----------------------------------");
+    SerialMon.println("Setup: Initializing SPIFFS...");
+    if (!SPIFFS.begin(true)) {
+        SerialMon.println("SPIFFS initialization failed, attempting format...");
+        if (SPIFFS.format()) {
+            SerialMon.println("SPIFFS formatted, retrying initialization...");
+            if (SPIFFS.begin(true)) {
+                SerialMon.println("SPIFFS initialized successfully after format");
+            } else {
+                SerialMon.println("SPIFFS initialization failed even after format, using default certificates");
+            }
+        } else {
+            SerialMon.println("SPIFFS format failed, using default certificates");
+        }
+    } else {
+        SerialMon.println("SPIFFS initialized successfully");
+
+        // Check SPIFFS integrity
+        SerialMon.printf("SPIFFS Total: %d bytes, Used: %d bytes\n", SPIFFS.totalBytes(), SPIFFS.usedBytes());
+
+        // Test certificate file existence and readability
+        SerialMon.println("Checking certificate files...");
+        bool foundCertFiles = false;
+
+        if (SPIFFS.exists("/ca_cert.pem")) {
+            File caFile = SPIFFS.open("/ca_cert.pem", "r");
+            if (caFile && caFile.size() > 100) {
+                SerialMon.printf("CA certificate found (%d bytes)\n", caFile.size());
+                foundCertFiles = true;
+            } else {
+                SerialMon.println("CA certificate file invalid or too small");
+            }
+            if (caFile) caFile.close();
+        } else {
+            SerialMon.println("CA certificate not found - will use defaults");
+        }
+
+        if (SPIFFS.exists("/device_cert.pem")) {
+            File devFile = SPIFFS.open("/device_cert.pem", "r");
+            if (devFile && devFile.size() > 100) {
+                SerialMon.printf("Device certificate found (%d bytes)\n", devFile.size());
+                foundCertFiles = true;
+            } else {
+                SerialMon.println("Device certificate file invalid or too small");
+            }
+            if (devFile) devFile.close();
+        } else {
+            SerialMon.println("Device certificate not found - will use defaults");
+        }
+
+        if (SPIFFS.exists("/private_key.pem")) {
+            File keyFile = SPIFFS.open("/private_key.pem", "r");
+            if (keyFile && keyFile.size() > 100) {
+                SerialMon.printf("Private key found (%d bytes)\n", keyFile.size());
+                foundCertFiles = true;
+            } else {
+                SerialMon.println("Private key file invalid or too small");
+            }
+            if (keyFile) keyFile.close();
+        } else {
+            SerialMon.println("Private key not found - will use defaults");
+        }
+
+        if (foundCertFiles) {
+            SerialMon.println("Certificate files detected - will load from SPIFFS");
+        } else {
+            SerialMon.println("No certificate files found - using defaults from flash");
+        }
+    }
+    esp_task_wdt_reset();
+
+    // Initialize sensors after SPIFFS
+    SerialMon.println("-----------------------------------");
+    SerialMon.println("Setup: Initializing sensors...");
+    testSensorManager.begin();
+    esp_task_wdt_reset();
+
+    SerialMon.println("-----------------------------------");
+    SerialMon.println("Setup: Starting GSM connection...");
+    try {
+        gsmConnection.gsmConnect();
+        esp_task_wdt_reset(); // Reset after GSM connection
+        SerialMon.println("Setup: GSM connection complete!");
+    } catch (...) {
+        SerialMon.println("Setup: GSM connection failed, continuing...");
+        esp_task_wdt_reset();
+    }
+
+    SerialMon.println("-----------------------------------");
+    SerialMon.println("Setup: Validating certificates...");
+
+    // Create config instance to validate certificates
+    Config tempConfig;
+    tempConfig.begin();
+
+    const char* caCert = tempConfig.getCaCert();
+    const char* deviceCert = tempConfig.getDeviceCert();
+    const char* privateKey = tempConfig.getPrivateKey();
+
+    bool certsValid = true;
+    if (!caCert || strlen(caCert) < 100) {
+        SerialMon.println("ERROR: CA certificate invalid or missing");
+        certsValid = false;
+    } else {
+        SerialMon.printf("CA certificate loaded: %d bytes\n", strlen(caCert));
+        if (!strstr(caCert, "-----BEGIN CERTIFICATE-----") || !strstr(caCert, "-----END CERTIFICATE-----")) {
+            SerialMon.println("WARNING: CA certificate format may be invalid");
+        }
+    }
+
+    if (!deviceCert || strlen(deviceCert) < 100) {
+        SerialMon.println("ERROR: Device certificate invalid or missing");
+        certsValid = false;
+    } else {
+        SerialMon.printf("Device certificate loaded: %d bytes\n", strlen(deviceCert));
+        if (!strstr(deviceCert, "-----BEGIN CERTIFICATE-----") || !strstr(deviceCert, "-----END CERTIFICATE-----")) {
+            SerialMon.println("WARNING: Device certificate format may be invalid");
+        }
+    }
+
+    if (!privateKey || strlen(privateKey) < 100) {
+        SerialMon.println("ERROR: Private key invalid or missing");
+        certsValid = false;
+    } else {
+        SerialMon.printf("Private key loaded: %d bytes\n", strlen(privateKey));
+        if ((!strstr(privateKey, "-----BEGIN RSA PRIVATE KEY-----") && !strstr(privateKey, "-----BEGIN PRIVATE KEY-----")) ||
+            (!strstr(privateKey, "-----END RSA PRIVATE KEY-----") && !strstr(privateKey, "-----END PRIVATE KEY-----"))) {
+            SerialMon.println("WARNING: Private key format may be invalid");
+        }
+    }
+
+    if (certsValid) {
+        SerialMon.println("All certificates loaded and validated successfully");
+    } else {
+        SerialMon.println("Certificate validation failed - SSL connections may fail");
+    }
+
+    SerialMon.println("-----------------------------------");
+    SerialMon.println("Setup: Initializing AWS connection...");
+    try {
+        awsConnection = new AwsConnection(gsmConnection.getSslClient(), gsmConnection.getModem());
+        esp_task_wdt_reset(); // Reset after object creation
+
+        SerialMon.println("Setup: Connecting to AWS...");
+        awsConnection->awsConnect();
+        esp_task_wdt_reset(); // Reset after AWS connection
+        SerialMon.println("Setup: AWS connection complete!");
+    } catch (...) {
+        SerialMon.println("Setup: AWS connection failed, continuing...");
+        esp_task_wdt_reset();
+    }
+
+    SerialMon.println("-----------------------------------");
+    SerialMon.println("Setup: Initializing MQTT utilities...");
+    mqttUtils = new MqttUtils(gsmConnection.getSslClient(), gsmConnection.getModem());
+    esp_task_wdt_reset(); // Reset after MQTT utils creation
+
+    deviceActivated = mqttUtils->isDeviceActivated();
+    SerialMon.printf("Device activation status: %s\n", deviceActivated ? "ACTIVATED" : "NOT ACTIVATED");
+    esp_task_wdt_reset();
+
+    SerialMon.println("-----------------------------------");
+    SerialMon.println("Setup: Entering main loop...");
+    lastWeatherUpdate = millis();
+}
+
+void loop() {
+    esp_task_wdt_reset();
+    unsigned long currentMillis = millis();
+    // Maintain GSM connection
+    if (!gsmConnection.isGsmConnected()) {
+        SerialMon.println("GSM disconnected. Reconnecting...");
+        SerialMon.println("-----------------------------------");
+        gsmConnection.gsmConnect();
+    }
+
+    // Maintain AWS/MQTT connection
+    if (awsConnection && !awsConnection->isAwsConnected()) {
+        SerialMon.println("AWS/MQTT disconnected. Reconnecting...");
+        SerialMon.println("-----------------------------------");
+        awsConnection->awsConnect();
+    }
+
+    // Process MQTT messages
+    if (mqttUtils && awsConnection && awsConnection->isAwsConnected()) {
+        mqttUtils->loop(); // Service MQTT client
+    }
+
+    // Update network health monitoring
+    if (mqttUtils) {
+        mqttUtils->updateNetworkHealth();
+    }
+
+    // Publish weather data at regular intervals    
+    if (currentMillis - lastWeatherUpdate >= WEATHER_UPDATE_INTERVAL) {
+        lastWeatherUpdate = currentMillis;
+
+        if (mqttUtils) {
+            if (deviceActivated) {
+                // Publish weather data (will handle online/offline automatically)
+                mqttUtils->publishWeatherData();    
+                SerialMon.println("Weather data published/stored");
+                SerialMon.println("-----------------------------------");
+            }
+
+            // Check and sync offline data when connection available
+            mqttUtils->checkAndSyncData();
+        }
+        esp_task_wdt_reset();
+    }
+
+    // Small delay to prevent overwhelming the system
+    delay(100);
+}

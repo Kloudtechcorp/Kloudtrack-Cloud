@@ -5,7 +5,7 @@ SensorManager::SensorManager()
 
 void SensorManager::begin() {
     Wire.begin();
-    Wire.setClock(400000); // Set I2C frequency to 400kHz
+    Wire.setClock(100000); // Set I2C frequency to 100kHz
 
     // Initialize BME280 Sensor
     if (!bme.begin(0x76)) {
@@ -19,7 +19,7 @@ void SensorManager::begin() {
     // Initialize BMP180 Sensor
     if (!bmp.begin()) {
         Serial.println("BMP180 failed.");
-        bmpReady= false;
+        bmpReady = false;
     } else {
         Serial.println("BMP180 ready.");
         bmpReady = true;
@@ -44,31 +44,52 @@ void SensorManager::begin() {
     }
 
     // Initialize GUVA-S12SD Sensor
+    pinMode(UV_PIN, INPUT);
     analogReadResolution(12);
     analogSetAttenuation(ADC_11db);
+    
+    // Allow ADC to stabilize
+    delay(100);
+
+    // Take multiple readings for stability
     int sensorValue = 0;
+    int validReadings = 0;
+    
     for (int i = 0; i < 10; i++) {
-        sensorValue += analogRead(UV_PIN);
-        delay(10);
+        int reading = analogRead(UV_PIN);
+        // Serial.printf("UV reading %d: %d\n", i+1, reading);
+        
+        if (reading >= 0 && reading <= 4095) {
+            sensorValue += reading;
+            validReadings++;
+        }
+        delay(50);
     }
-    sensorValue /= 10;
-    float voltage = (sensorValue * 3.3) / 4095.0;
-    float uvIntensity = voltage * 1000.0;
-    if (uvIntensity < 50 && uvIntensity >= 1170) {
-        Serial.println("GUVA-S12SD ready.");
-        uvReady = true;
-    } 
-    else { 
-        Serial.println("GUVA-S12SD failed.");
+    
+    if (validReadings > 0) {
+        sensorValue /= validReadings;
+        float voltage = (sensorValue * 3.3) / 4095.0;
+        float uvIntensity = voltage * 1000.0;
+        
+        Serial.printf("UV sensor - Raw: %d, Voltage: %.3fV, Intensity: %.1fmV\n", 
+                     sensorValue, voltage, uvIntensity);
+        
+        // More reasonable range check (GUVAS12SD output: 0-1200mV typically)
+        if (sensorValue < 20 || sensorValue > 4090) {  // More realistic range
+            Serial.println("GUVA-S12SD failed.");
+            uvReady = false;
+        } else {
+            Serial.printf("GUVA-S12SD ready.");
+            uvReady = true;
+        }
+    } else {
+        Serial.println("GUVA-S12SD failed - no valid readings");
         uvReady = false;
     }
 
     // Initialize AS5600 Sensor
     loadCalibration();
-    Wire.beginTransmission(AS5600_ADDRESS);
-    Wire.write(AS5600_ANGLE_REG);
-    byte error = Wire.endTransmission();
-    if (error != 0) {
+    if (!retryI2COperation(AS5600_ADDRESS)) {
         Serial.println("AS5600 failed.");
         directionReady = false;
     } else {
@@ -77,9 +98,7 @@ void SensorManager::begin() {
     }
 
     // Initialize Slave Sensor
-    Wire.beginTransmission(SLAVE_ADDRESS);
-    byte slaveError = Wire.endTransmission();
-    if (slaveError != 0) {
+    if (!retryI2COperation(SLAVE_ADDRESS)) {
         Serial.println("Slave failed.");
         slaveReady = false;
     } else {
@@ -111,7 +130,7 @@ SensorReadings SensorManager::readAllSensors() {
     calculateAverages();
 
     // Function to read and calculate UV index
-    readUvIntensity();
+    uvIntensity = readUvIntensity();
     calculateUvIndex();
 
     // Function to read wind direction
@@ -213,15 +232,27 @@ float SensorManager::readLightIntensity() {
 
 float SensorManager::readUvIntensity() {
     if (!uvReady) return NAN;
+    
     int sensorValue = 0;
-    for (int i = 0; i < 10; i++) {
-        sensorValue += analogRead(UV_PIN);
-        delay(10);
+    int validReadings = 0;
+    
+    for (int i = 0; i < 10; i++) {  // Reduced readings for regular operation
+        int reading = analogRead(UV_PIN);
+        if (reading >= 0 && reading <= 4095) {
+            sensorValue += reading;
+            validReadings++;
+        }
+        delay(50);
     }
-    sensorValue /= 10;
+    
+    if (validReadings == 0) return NAN;
+    
+    sensorValue /= validReadings;
     float voltage = (sensorValue * 3.3) / 4095.0;
     float uvIntensity = voltage * 1000.0;
-    if (sensorValue < 150 || sensorValue > 4000) return NAN;
+    
+    // Return the intensity in mV, allowing full range
+    if (sensorValue < 20 || sensorValue > 4090) return NAN;  // Only exclude extreme values
     return isnan(uvIntensity) ? NAN : uvIntensity;
 }
 
@@ -243,31 +274,104 @@ int SensorManager::calculateUvIndex() {
 }
 
 void SensorManager::updateSlaveReadings() {
-    Wire.beginTransmission(SLAVE_ADDRESS);
-    byte error = Wire.endTransmission();
+    // Skip if slave is not ready to avoid spam
+    if (!slaveReady) {
+        Serial.println("Slave sensor not available - wind speed and precipitation measurement skipped");
+        precipitation = NAN;
+        windSpeed = NAN;
+        return;
+    }
 
-    if (error != 0) {
+    if (!retryI2COperation(SLAVE_ADDRESS)) {
+        slaveReady = false;
+        precipitation = NAN;
+        windSpeed = NAN;
         return;
     }
 
     Wire.requestFrom(SLAVE_ADDRESS, 4);
 
-    // Get rain count and solve for precipitation
-    if (Wire.available() >= 2) {
-        byte msb = Wire.read();
-        byte lsb = Wire.read();
-        rainCount = (msb << 8) | lsb;
+    // Check if we received the expected number of bytes
+    if (Wire.available() < 4) {
+        Serial.printf("Wire read failed: only %d bytes available, expected 4\n", Wire.available());
+        // Clear any remaining bytes and mark slave as not ready
+        while (Wire.available()) Wire.read();
+        slaveReady = false;
+        precipitation = NAN;
+        windSpeed = NAN;
+        return;
     }
-    precipitation = rainCount * tipValue;
 
-    // Get wind count and solve for wind speed
-    if (Wire.available()) {
-        byte msb = Wire.read();
-        byte lsb = Wire.read();
-        windCount = (msb << 8) | lsb;
-    }
+    byte rainMsb = Wire.read();
+    byte rainLsb = Wire.read();
+    byte windMsb = Wire.read();
+    byte windLsb = Wire.read();
+    
+    // Calculate values only if we got valid data
+    uint16_t rainCount = (rainMsb << 8) | rainLsb;
+    uint16_t windCount = (windMsb << 8) | windLsb;
+    
+    precipitation = rainCount * tipValue;
     circumference = 2 * PI * radius * windSpeedCalibrationFactor;
     windSpeed = ((circumference * windCount * 3.6) / period);
+    
+    slaveReady = true;
+}
+
+bool SensorManager::retryI2COperation(uint8_t address, int maxRetries) {
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        Wire.beginTransmission(address);
+        byte error = Wire.endTransmission();
+        
+        if (error == 0) {
+            return true; // Success
+        }
+        
+        if (attempt < maxRetries - 1) {
+            // Serial.printf("I2C operation failed for address 0x%02X, attempt %d/%d\n", address, attempt + 1, maxRetries);
+            delay(10 * (attempt + 1)); // Exponential backoff delay
+        }
+    }
+    
+    Serial.printf("I2C operation failed for address 0x%02X after %d attempts\n", address, maxRetries);
+    return false;
+}
+
+float SensorManager::readAngleWithRetry(int maxRetries) {
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        Wire.beginTransmission(AS5600_ADDRESS);
+        Wire.write(AS5600_ANGLE_REG);
+        byte error = Wire.endTransmission();
+
+        if (error != 0) {
+            if (attempt < maxRetries - 1) {
+                Serial.printf("AS5600 transmission failed, attempt %d/%d\n", attempt + 1, maxRetries);
+                delay(10 * (attempt + 1));
+                continue;
+            }
+            return -1;
+        }
+
+        Wire.requestFrom(AS5600_ADDRESS, 2);
+
+        if (Wire.available() >= 2) {
+            byte highByte = Wire.read();
+            byte lowByte = Wire.read();
+
+            uint16_t rawValue = ((uint16_t)highByte << 8) | lowByte;
+            float degrees = (rawValue * 360.0) / 4096.0;
+
+            return degrees;
+        } else {
+            if (attempt < maxRetries - 1) {
+                Serial.printf("AS5600 read failed, attempt %d/%d\n", attempt + 1, maxRetries);
+                delay(10 * (attempt + 1));
+            }
+        }
+    }
+
+    Serial.printf("AS5600 read failed after %d attempts\n", maxRetries);
+    return -1;
 }
 
 void SensorManager::calculateAverages() {
@@ -374,27 +478,7 @@ void SensorManager::saveCalibration() {
 }
 
 float SensorManager::readAngle() {
-    Wire.beginTransmission(AS5600_ADDRESS);
-    Wire.write(AS5600_ANGLE_REG);
-    byte error = Wire.endTransmission();
-
-    if (error != 0) {
-        return -1;
-    }
-
-    Wire.requestFrom(AS5600_ADDRESS, 2);
-
-    if (Wire.available() >= 2) {
-    byte highByte = Wire.read();
-    byte lowByte = Wire.read();
-
-    uint16_t rawValue = ((uint16_t)highByte << 8) | lowByte;
-    degrees = (rawValue * 360.0) / 4096.0;
-
-    return degrees;
-    }
-
-    return -1;
+    return readAngleWithRetry();
 }
 
 float SensorManager::applyWindvaneCalibration(float rawAngle) {
@@ -431,6 +515,11 @@ void SensorManager::calibrateNorth() {
   
   Serial.println("Calibrating...");
   for (int i = 0; i < 20; i++) {
+    // Reset watchdog every few iterations
+    if (i % 5 == 0) {
+      esp_task_wdt_reset();
+    }
+    
     float angle = readAngle();
     if (angle >= 0) {
       totalAngle += angle;
@@ -457,52 +546,63 @@ void SensorManager::calibrateNorth() {
 
 float SensorManager::performWindMeasurement() {
     // Check for serial commands
-  if (Serial.available()) {
-    char cmd = Serial.read();
-    if (cmd == 'c' || cmd == 'C') {
-      calibrateNorth();
-    } else if (cmd == 'r' || cmd == 'R') {
-      reverseDirection = !reverseDirection;
-      saveCalibration();
-      Serial.print("Direction reversed: ");
-      Serial.println(reverseDirection ? "YES" : "NO");
-    } else if (cmd == 't' || cmd == 'T') {
-      // Test measurement now
-      performWindMeasurement();
+    if (Serial.available()) {
+        char cmd = Serial.read();
+        if (cmd == 'c' || cmd == 'C') {
+        calibrateNorth();
+        } else if (cmd == 'r' || cmd == 'R') {
+        reverseDirection = !reverseDirection;
+        saveCalibration();
+        Serial.print("Direction reversed: ");
+        Serial.println(reverseDirection ? "YES" : "NO");
+        } else if (cmd == 't' || cmd == 'T') {
+            // Test measurement now
+            Serial.println("Taking test measurement...");
+        }
     }
-  }
 
-  float readings[BURST_SAMPLES];
-  int validReadings = 0;
-  
-  Serial.print("Collecting data");
-  
-  // Take burst of readings over 3 seconds
-  for (int i = 0; i < BURST_SAMPLES; i++) {
-    float rawAngle = readAngle();
+    // Skip measurement if sensor is not ready to avoid spam
+    if (!directionReady) {
+        Serial.println("AS5600 not available - wind direction measurement skipped");
+        return NAN;
+    }
+
+    float readings[BURST_SAMPLES];
+    int validReadings = 0;
     
-    if (rawAngle >= 0) {
-      // Apply calibration immediately
-      readings[validReadings] = applyWindvaneCalibration(rawAngle);
-      validReadings++;
+    Serial.print("Collecting data");
+    
+    // Take burst of readings over 3 seconds
+    for (int i = 0; i < BURST_SAMPLES; i++) {
+        // Reset watchdog every 10 samples to prevent timeout
+        if (i % 10 == 0) {
+            esp_task_wdt_reset();
+        }
+        
+        float rawAngle = readAngle();
+        
+        if (rawAngle >= 0) {
+        // Apply calibration immediately
+        readings[validReadings] = applyWindvaneCalibration(rawAngle);
+        validReadings++;
+        }
+        
+        // Show progress
+        if (i % 10 == 0) Serial.print(".");
+        
+        delay(SAMPLE_INTERVAL);
     }
     
-    // Show progress
-    if (i % 10 == 0) Serial.print(".");
+    Serial.println();
     
-    delay(SAMPLE_INTERVAL);
-  }
-  
-  Serial.println();
-  
-  if (validReadings < 15) { // Need at least half the samples
-    Serial.println("ERROR: Insufficient valid readings");
-    return NAN;
-  }
-  
-  // Calculate statistics
-  windDirection = calculateCircularAverage(readings, validReadings);
-  Serial.println();
+    if (validReadings < 15) { // Need at least half the samples
+        Serial.println("ERROR: Insufficient valid readings");
+        return NAN;
+    }
+    
+    // Calculate statistics
+    windDirection = calculateCircularAverage(readings, validReadings);
+    Serial.println();
 
-  return windDirection;
+    return windDirection;
 }

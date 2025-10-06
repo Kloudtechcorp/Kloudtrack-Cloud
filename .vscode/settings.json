@@ -2,6 +2,8 @@
     "files.associations": {
         ".css": "tailwindcss",
         "new": "cpp",
-        "cmath": "cpp"
+        "cmath": "cpp",
+        "system_error": "cpp",
+        "*.tpp": "cpp"
     }
 }

@@ -4,8 +4,11 @@ SensorManager::SensorManager()
     : light(0x23) {}
 
 void SensorManager::begin() {
-    Wire.begin();
+    pinMode(SCL_PIN, INPUT_PULLUP);
+    pinMode(SDA_PIN, INPUT_PULLUP);
+    Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(100000); // Set I2C frequency to 100kHz
+    delay(100);
 
     // Initialize BME280 Sensor
     if (!bme.begin(0x76)) {

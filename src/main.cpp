@@ -1263,7 +1263,24 @@ void initGSM() {
 void connectToAWS()
 {
   esp_task_wdt_reset(); // Reset watchdog at start
-  
+
+  // Track total time spent in connection attempts to prevent infinite blocking
+  static unsigned long connectionStartTime = 0;
+  const unsigned long MAX_CONNECTION_ATTEMPT_TIME = 120000; // 2 minutes max
+
+  // Start timing if this is a fresh attempt
+  if (connectionStartTime == 0 || (millis() - connectionStartTime > MAX_CONNECTION_ATTEMPT_TIME)) {
+    connectionStartTime = millis();
+  }
+
+  // Check if we've exceeded maximum connection attempt time
+  if (millis() - connectionStartTime > MAX_CONNECTION_ATTEMPT_TIME) {
+    Serial.println("ERROR: Maximum connection attempt time exceeded (2 minutes)");
+    Serial.println("Restarting device to recover from connection failure...");
+    delay(1000);
+    ESP.restart();
+  }
+
   if (modem.isNetworkConnected())
   {
     SerialMon.println("Connecting to AWS IoT...");
@@ -1467,35 +1484,31 @@ void connectToAWS()
       Serial.println("Testing SSL connection to AWS IoT endpoint...");
       Serial.printf("Free heap before SSL test: %d bytes\n", ESP.getFreeHeap());
       
-      // Verify GSM connection is stable before SSL attempt
-      if (!baseClient.connected()) {
-        Serial.println("Base GSM client not connected - reconnecting...");
-        baseClient.stop();
-        delay(1000);
-        
-        // Wait for GSM to be ready
-        for (int i = 0; i < 10 && !modem.isNetworkConnected(); i++) {
-          Serial.print(".");
-          delay(1000);
-        }
-        Serial.println();
-        
-        if (!modem.isNetworkConnected()) {
-          Serial.println("GSM network not available for SSL connection");
-          return;
-        }
+      // Verify GSM network is available (baseClient connection will be handled by SSL layer)
+      if (!modem.isNetworkConnected()) {
+        Serial.println("GSM network not connected - cannot establish SSL connection");
+        return;
       }
+
+      // Note: We don't need to check baseClient.connected() here because:
+      // 1. The SSL client will establish the TCP connection automatically
+      // 2. Checking baseClient state can cause false negatives
+      // 3. The previous check would block for up to 10s without proper watchdog management
       
       // Test SSL connection with timeout and better error handling
       unsigned long sslTestStart = millis();
-      
+
       // Force a clean SSL state before testing
       delay(500);
       esp_task_wdt_reset();
-      
+
+      Serial.println("Attempting SSL connection (this may take up to 30 seconds)...");
       bool sslConnected = sslClient.connect(config.getAwsIotEndpoint(), config.getAwsIotPort());
       unsigned long sslTestDuration = millis() - sslTestStart;
-      
+
+      // Reset watchdog after potentially long SSL connection attempt
+      esp_task_wdt_reset();
+
       Serial.printf("SSL connection test took %lu ms\n", sslTestDuration);
       
       if (sslConnected) {
@@ -1588,6 +1601,7 @@ void connectToAWS()
         Serial.println("MQTT Connected successfully!");
         mqttRetryCount = 0;
         reconnectDelay = 1000;
+        connectionStartTime = 0; // Reset connection timer on success
 
         // Subscribe to all relevant topics
         Serial.printf("Subscribing to command topic: %s\n", config.getAwsIotDeviceCommandTopic());
@@ -1858,50 +1872,50 @@ void setup()
     Serial.println("Checking certificate files...");
     bool foundCertFiles = false;
     
-    if (SPIFFS.exists("/ca_cert.pem")) {
-      File caFile = SPIFFS.open("/ca_cert.pem", "r");
-      if (caFile && caFile.size() > 100) { // Minimum reasonable cert size
-        Serial.printf("CA certificate found (%d bytes)\n", caFile.size());
-        foundCertFiles = true;
-      } else {
-        Serial.println("CA certificate file invalid or too small");
-      }
-      if (caFile) caFile.close();
-    } else {
-      Serial.println("CA certificate not found - will use defaults");
-    }
+    // if (SPIFFS.exists("/ca_cert.pem")) {
+    //   File caFile = SPIFFS.open("/ca_cert.pem", "r");
+    //   if (caFile && caFile.size() > 100) { // Minimum reasonable cert size
+    //     Serial.printf("CA certificate found (%d bytes)\n", caFile.size());
+    //     foundCertFiles = true;
+    //   } else {
+    //     Serial.println("CA certificate file invalid or too small");
+    //   }
+    //   if (caFile) caFile.close();
+    // } else {
+    //   Serial.println("CA certificate not found - will use defaults");
+    // }
     
-    if (SPIFFS.exists("/device_cert.pem")) {
-      File devFile = SPIFFS.open("/device_cert.pem", "r");
-      if (devFile && devFile.size() > 100) {
-        Serial.printf("Device certificate found (%d bytes)\n", devFile.size());
-        foundCertFiles = true;
-      } else {
-        Serial.println("Device certificate file invalid or too small");
-      }
-      if (devFile) devFile.close();
-    } else {
-      Serial.println("Device certificate not found - will use defaults");
-    }
+    // if (SPIFFS.exists("/device_cert.pem")) {
+    //   File devFile = SPIFFS.open("/device_cert.pem", "r");
+    //   if (devFile && devFile.size() > 100) {
+    //     Serial.printf("Device certificate found (%d bytes)\n", devFile.size());
+    //     foundCertFiles = true;
+    //   } else {
+    //     Serial.println("Device certificate file invalid or too small");
+    //   }
+    //   if (devFile) devFile.close();
+    // } else {
+    //   Serial.println("Device certificate not found - will use defaults");
+    // }
     
-    if (SPIFFS.exists("/private_key.pem")) {
-      File keyFile = SPIFFS.open("/private_key.pem", "r");
-      if (keyFile && keyFile.size() > 100) {
-        Serial.printf("Private key found (%d bytes)\n", keyFile.size());
-        foundCertFiles = true;
-      } else {
-        Serial.println("Private key file invalid or too small");
-      }
-      if (keyFile) keyFile.close();
-    } else {
-      Serial.println("Private key not found - will use defaults");
-    }
+    // if (SPIFFS.exists("/private_key.pem")) {
+    //   File keyFile = SPIFFS.open("/private_key.pem", "r");
+    //   if (keyFile && keyFile.size() > 100) {
+    //     Serial.printf("Private key found (%d bytes)\n", keyFile.size());
+    //     foundCertFiles = true;
+    //   } else {
+    //     Serial.println("Private key file invalid or too small");
+    //   }
+    //   if (keyFile) keyFile.close();
+    // } else {
+    //   Serial.println("Private key not found - will use defaults");
+    // }
     
-    if (foundCertFiles) {
-      LOG_INFO_MSG("SPIFFS", "Certificate files detected - will load from SPIFFS");
-    } else {
-      LOG_INFO_MSG("SPIFFS", "No certificate files found - using defaults from flash");
-    }
+    // if (foundCertFiles) {
+    //   LOG_INFO_MSG("SPIFFS", "Certificate files detected - will load from SPIFFS");
+    // } else {
+    //   LOG_INFO_MSG("SPIFFS", "No certificate files found - using defaults from flash");
+    // }
   }
   
   config.begin();

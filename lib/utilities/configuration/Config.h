@@ -36,7 +36,7 @@ private:
     void freeCertificates();
 
 public:
-    static constexpr const char *FIRMWARE_VERSION = "2.3.4";
+    static constexpr const char *FIRMWARE_VERSION = "2.4.1";
     static constexpr const char *PREFERENCES_NAMESPACE = "credentials";
 
     Config();

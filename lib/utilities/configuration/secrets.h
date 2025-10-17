@@ -9,7 +9,7 @@ const char APN[] = "internet";
 const char AWS_IOT_ENDPOINT[] = "a68bn74ibyvu1-ats.iot.ap-southeast-1.amazonaws.com";
 const int AWS_IOT_PORT = 8883;
 
-// Amazon Root CA
+// Default Amazon Root CA 1
 static const char AWS_CERT_CA[] PROGMEM = R"EOF(
 -----BEGIN CERTIFICATE-----
 MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF
@@ -33,7 +33,7 @@ rqXRfboQnoZsG4q5WTP468SQvvG5
 -----END CERTIFICATE-----
 )EOF";
 
-// Device Certificate
+// Default Device Certificate
 static const char AWS_CERT_CRT[] PROGMEM = R"KEY(
 -----BEGIN CERTIFICATE-----
 MIIDWTCCAkGgAwIBAgIUGgjhWJGrAuvqz9vwyqjHY/IT6wYwDQYJKoZIhvcNAQEL
@@ -57,7 +57,7 @@ J97E8OlhbLejEBquQRumsrQ2iy7bP5V8ZRnZfGf+yq/99xbutvShueNK7RPj
 -----END CERTIFICATE-----
 )KEY";
     
-// Device Private Key
+// Default Device Private Key
 static const char AWS_CERT_PRIVATE[] PROGMEM = R"KEY(
 -----BEGIN RSA PRIVATE KEY-----
 MIIEogIBAAKCAQEAmZq2B6w7AruYi6HdbSqrokhyemUovvc35QKkdt+ta9q6nGLb
@@ -87,3 +87,5 @@ UHlZIjCDCOfIFOuk8TpOA1samXbnC0ahlI7+AcSG6CfMNmwQMed6gjkQdFhzzaQ1
 kUL9OxuAa+W0FEWG/+R8KMMWigBcjtAOHqZqJ+t1+pcYOcLil3s=
 -----END RSA PRIVATE KEY-----
 )KEY";
+
+

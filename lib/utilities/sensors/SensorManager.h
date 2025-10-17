@@ -10,7 +10,10 @@
 #include <BH1750.h>
 #include <Preferences.h>
 #include <stdint.h>
+#include "esp_task_wdt.h"
 #define UV_PIN 32
+#define SCL_PIN 22
+#define SDA_PIN 21
 #define SLAVE_ADDRESS 0x03
 #define AS5600_ADDRESS 0x36
 #define AS5600_ANGLE_REG 0x0E
@@ -133,6 +136,10 @@ class SensorManager {
 
         // Function to update slave readings
         void updateSlaveReadings();
+        
+        // I2C retry helper functions
+        bool retryI2COperation(uint8_t address, int maxRetries = 3);
+        float readAngleWithRetry(int maxRetries = 3);
 };
 
 #endif

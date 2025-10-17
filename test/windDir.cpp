@@ -192,7 +192,7 @@ void performWindMeasurement() {
 void setup() {
   Serial.begin(115200);
   Wire.begin(21, 22); // Explicitly set SDA=21, SCL=22
-  Wire.setClock(400000); // Set I2C clock to 400kHz
+  Wire.setClock(100000); // Set I2C clock to 400kHz
   
   // Load calibration from preferences
   loadCalibration();

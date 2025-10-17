@@ -68,7 +68,7 @@ int DateTime::begin(HardwareSerial &serialAT)
     unsigned long newEpoch = convertToEpoch(year, month, day, hour, minute, second);
 
     // Filtering: Ignore large jumps
-    if (lastEpoch == 0 || abs((long)newEpoch - (long)lastEpoch) <= TIME_THRESHOLD)
+    if (lastEpoch == 0 || labs((long)newEpoch - (long)lastEpoch) <= TIME_THRESHOLD)
     {
         lastEpoch = newEpoch;
         _inner = "20" + year + "-" + month + "-" + day + " " + hour + ":" + minute + ":" + second;
@@ -76,7 +76,7 @@ int DateTime::begin(HardwareSerial &serialAT)
     else
     {
         Serial.print("Time jump detected (");
-        Serial.print(abs((long)newEpoch - (long)lastEpoch));
+        Serial.print(labs((long)newEpoch - (long)lastEpoch));
         Serial.println("s), ignoring...");
     }
 

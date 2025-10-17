@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <SD.h>
 #include <SPI.h>
+#include <esp_task_wdt.h>
 
 // SD Card pins for A7670G module TF card interface
 #define SD_MISO_PIN 2
@@ -52,12 +53,19 @@ bool SdCard::beginInner()
     File root = SD.open(SD_DATA_DIR);
     if (root)
     {
+        int fileCount = 0;
         File file = root.openNextFile();
         while (file)
         {
             _pendingRecords++;
             file.close();
             file = root.openNextFile();
+            fileCount++;
+            
+            // Reset watchdog every 20 files to prevent timeout during large file counts
+            if (fileCount % 20 == 0) {
+                esp_task_wdt_reset();
+            }
         }
         root.close();
     }
